@@ -1,9 +1,12 @@
 import json
+import logging
 from collections.abc import AsyncGenerator
 
 import httpx
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
@@ -28,9 +31,12 @@ class OllamaClient:
             "messages": messages,
             "stream": False,
         }
+        logger.info("POST /api/chat model=%s messages=%d", payload["model"], len(messages))
+        logger.debug("Request payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
         resp = await self._client.post("/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
+        logger.info("Response: model=%s content_length=%d", data["model"], len(data["message"]["content"]))
         return {
             "role": data["message"]["role"],
             "content": data["message"]["content"],
@@ -48,6 +54,8 @@ class OllamaClient:
             "messages": messages,
             "stream": True,
         }
+        logger.info("POST /api/chat [stream] model=%s messages=%d", payload["model"], len(messages))
+        logger.debug("Request payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
         async with self._client.stream("POST", "/api/chat", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
