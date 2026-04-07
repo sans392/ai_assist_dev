@@ -255,8 +255,7 @@
         const statusText = document.getElementById('status-text');
 
         let isStreaming = false;
-        let conversationId = crypto.randomUUID();
-        let messages = [];
+        let conversationId = null;  // assigned by server on first response
 
         // Auto-resize textarea
         inputEl.addEventListener('input', () => {
@@ -327,21 +326,22 @@
             inputEl.style.height = 'auto';
 
             addMessage('user', text);
-            messages.push({ role: 'user', content: text });
 
             const contentEl = addMessage('assistant', '');
             contentEl.innerHTML = '<span class="typing-indicator"></span>';
 
             try {
+                const body = {
+                    message: text,
+                    mode: modeEl.value,
+                    stream: true,
+                };
+                if (conversationId) body.conversation_id = conversationId;
+
                 const resp = await fetch('/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        messages: messages,
-                        mode: modeEl.value,
-                        stream: true,
-                        conversation_id: conversationId,
-                    }),
+                    body: JSON.stringify(body),
                 });
 
                 if (!resp.ok) {
@@ -369,11 +369,12 @@
                                 contentEl.innerHTML = formatText(fullText);
                                 chatEl.scrollTop = chatEl.scrollHeight;
                             }
+                            if (data.conversation_id) {
+                                conversationId = data.conversation_id;
+                            }
                         } catch { /* skip malformed lines */ }
                     }
                 }
-
-                messages.push({ role: 'assistant', content: fullText });
 
             } catch (err) {
                 contentEl.innerHTML = `<span style="color:#f44336">Error: ${err.message}</span>`;

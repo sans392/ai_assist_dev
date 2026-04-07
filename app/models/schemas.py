@@ -9,13 +9,17 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[Message]
+    message: str = Field(description="User message text")
     mode: str = Field(default="general", description="Agent mode: general, financial, etc.")
     stream: bool = False
-    conversation_id: str | None = None
+    conversation_id: str | None = Field(
+        default=None,
+        description="Conversation ID. Omit to start a new conversation.",
+    )
 
 
 class ChatResponse(BaseModel):
     message: Message
     model: str
     mode: str
+    conversation_id: str
