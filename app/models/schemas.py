@@ -1,0 +1,21 @@
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class Message(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[Message]
+    mode: str = Field(default="general", description="Agent mode: general, financial, etc.")
+    stream: bool = False
+    conversation_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    message: Message
+    model: str
+    mode: str
