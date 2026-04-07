@@ -2,19 +2,26 @@
 
 Backend for an AI assistant learning project. Communicates with a local [Ollama](https://ollama.com/) instance.
 
-## Quick Start
+## Quick Start (Docker)
+
+Assumes Ollama is already running via Docker Compose on network `ollama-net`.
 
 ```bash
-# Install dependencies
-pip install -e ".[dev]"
-
-# Copy env config
+# Copy env config and set your Ollama container name
 cp .env.example .env
 
-# Make sure Ollama is running locally
-ollama serve
+# Start
+docker compose up --build
+```
 
-# Start the server
+API will be available at `http://localhost:8000`. Code changes in `app/` apply instantly (hot-reload via volume mount).
+
+## Quick Start (Local)
+
+```bash
+pip install -e ".[dev]"
+cp .env.example .env
+# Set OLLAMA_BASE_URL=http://localhost:11434 in .env
 uvicorn app.main:app --reload
 ```
 
