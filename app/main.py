@@ -8,13 +8,20 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
+from app.services.log_collector import log_collector
 
+log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
 logging.basicConfig(
     level=settings.log_level.upper(),
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    format=log_format,
     datefmt="%H:%M:%S",
 )
-from app.routers import chat, health
+# Attach in-memory collector to root logger
+log_collector.setFormatter(logging.Formatter(log_format, datefmt="%H:%M:%S"))
+log_collector.setLevel(logging.DEBUG)
+logging.getLogger().addHandler(log_collector)
+
+from app.routers import admin, chat, health
 from app.services.conversation import ConversationStore
 from app.services.ollama import OllamaClient
 
@@ -48,6 +55,7 @@ app.add_middleware(
 
 app.include_router(chat.router)
 app.include_router(health.router)
+app.include_router(admin.router)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

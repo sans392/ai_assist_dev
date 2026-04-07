@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin — Logs</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+            background: #0a0a0a;
+            color: #d4d4d4;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 20px;
+            background: #1a1a1a;
+            border-bottom: 1px solid #2a2a2a;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        header h1 {
+            font-size: 15px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .controls label {
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+        }
+
+        .controls input[type="checkbox"] {
+            accent-color: #7c3aed;
+        }
+
+        .controls button {
+            background: #2a2a2a;
+            color: #d4d4d4;
+            border: 1px solid #3a3a3a;
+            border-radius: 6px;
+            padding: 5px 12px;
+            font-size: 12px;
+            font-family: inherit;
+            cursor: pointer;
+        }
+
+        .controls button:hover { background: #3a3a3a; }
+
+        .controls button.active {
+            background: #7c3aed;
+            border-color: #7c3aed;
+            color: #fff;
+        }
+
+        .stats {
+            font-size: 12px;
+            color: #666;
+            padding: 6px 20px;
+            background: #111;
+            border-bottom: 1px solid #1a1a1a;
+        }
+
+        #logs {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+
+        .log-entry {
+            padding: 3px 20px;
+            font-size: 12px;
+            line-height: 1.6;
+            border-left: 3px solid transparent;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .log-entry:hover {
+            background: #111;
+        }
+
+        .log-entry.ollama {
+            border-left-color: #7c3aed;
+            background: #0f0a1a;
+        }
+
+        .log-entry .time {
+            color: #555;
+        }
+
+        .log-entry .level-DEBUG { color: #666; }
+        .log-entry .level-INFO { color: #4caf50; }
+        .log-entry .level-WARNING { color: #ff9800; }
+        .log-entry .level-ERROR { color: #f44336; }
+
+        .log-entry .logger {
+            color: #5599cc;
+        }
+
+        .log-entry .msg {
+            color: #d4d4d4;
+        }
+
+        .log-entry.ollama .msg {
+            color: #c8b0ff;
+        }
+
+        .payload-block {
+            margin: 4px 0 4px 20px;
+            padding: 8px 12px;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #b0b0b0;
+            overflow-x: auto;
+        }
+
+        .empty-state {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #444;
+            font-size: 14px;
+        }
+
+        .nav-link {
+            color: #5599cc;
+            text-decoration: none;
+            font-size: 12px;
+        }
+
+        .nav-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <header>
+        <div style="display:flex; align-items:center; gap: 16px;">
+            <h1>Admin / Logs</h1>
+            <a href="/" class="nav-link">Back to Chat</a>
+        </div>
+        <div class="controls">
+            <label>
+                <input type="checkbox" id="ollama-only">
+                Ollama only
+            </label>
+            <label>
+                <input type="checkbox" id="auto-scroll" checked>
+                Auto-scroll
+            </label>
+            <button id="refresh-btn">Refresh</button>
+            <button id="auto-refresh-btn" class="active">Auto (3s)</button>
+            <button id="clear-btn">Clear view</button>
+        </div>
+    </header>
+    <div class="stats" id="stats">Loading...</div>
+    <div id="logs">
+        <div class="empty-state">Waiting for logs...</div>
+    </div>
+
+    <script>
+        const logsEl = document.getElementById('logs');
+        const statsEl = document.getElementById('stats');
+        const ollamaOnlyEl = document.getElementById('ollama-only');
+        const autoScrollEl = document.getElementById('auto-scroll');
+        const refreshBtn = document.getElementById('refresh-btn');
+        const autoRefreshBtn = document.getElementById('auto-refresh-btn');
+        const clearBtn = document.getElementById('clear-btn');
+
+        let autoRefreshInterval = null;
+        let autoRefreshActive = true;
+        let lastEntryCount = 0;
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatLogEntry(entry) {
+            const date = new Date(entry.timestamp * 1000);
+            const time = date.toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 1 });
+
+            const msg = entry.message;
+            const isOllama = entry.is_ollama;
+            const cssClass = `log-entry${isOllama ? ' ollama' : ''}`;
+
+            // Check if message contains a JSON payload (Request payload)
+            let html = '';
+            const payloadMatch = msg.match(/Request payload:\s*(\{[\s\S]*)/);
+            if (payloadMatch) {
+                const beforePayload = msg.substring(0, msg.indexOf('Request payload:') + 'Request payload:'.length);
+                html = `<div class="${cssClass}">${escapeHtml(beforePayload)}<div class="payload-block">${escapeHtml(payloadMatch[1])}</div></div>`;
+            } else {
+                html = `<div class="${cssClass}">${escapeHtml(msg)}</div>`;
+            }
+
+            return html;
+        }
+
+        async function fetchLogs() {
+            try {
+                const ollamaOnly = ollamaOnlyEl.checked;
+                const resp = await fetch(`/admin/logs?ollama_only=${ollamaOnly}&limit=500`);
+                const data = await resp.json();
+                const entries = data.logs;
+
+                statsEl.textContent = `${entries.length} log entries${ollamaOnly ? ' (Ollama only)' : ''} | Last updated: ${new Date().toLocaleTimeString()}`;
+
+                if (entries.length === 0) {
+                    logsEl.innerHTML = '<div class="empty-state">No logs yet. Send a message in the chat to see logs appear here.</div>';
+                    lastEntryCount = 0;
+                    return;
+                }
+
+                // Only re-render if count changed
+                if (entries.length !== lastEntryCount) {
+                    logsEl.innerHTML = entries.map(formatLogEntry).join('');
+                    lastEntryCount = entries.length;
+
+                    if (autoScrollEl.checked) {
+                        logsEl.scrollTop = logsEl.scrollHeight;
+                    }
+                }
+            } catch (err) {
+                statsEl.textContent = `Error fetching logs: ${err.message}`;
+            }
+        }
+
+        function toggleAutoRefresh() {
+            autoRefreshActive = !autoRefreshActive;
+            if (autoRefreshActive) {
+                autoRefreshBtn.classList.add('active');
+                autoRefreshBtn.textContent = 'Auto (3s)';
+                startAutoRefresh();
+            } else {
+                autoRefreshBtn.classList.remove('active');
+                autoRefreshBtn.textContent = 'Auto: off';
+                stopAutoRefresh();
+            }
+        }
+
+        function startAutoRefresh() {
+            stopAutoRefresh();
+            autoRefreshInterval = setInterval(fetchLogs, 3000);
+        }
+
+        function stopAutoRefresh() {
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+            }
+        }
+
+        refreshBtn.addEventListener('click', () => { lastEntryCount = 0; fetchLogs(); });
+        autoRefreshBtn.addEventListener('click', toggleAutoRefresh);
+        clearBtn.addEventListener('click', () => {
+            logsEl.innerHTML = '<div class="empty-state">View cleared. Logs continue to accumulate on the server.</div>';
+            lastEntryCount = 0;
+        });
+        ollamaOnlyEl.addEventListener('change', () => { lastEntryCount = 0; fetchLogs(); });
+
+        // Initial load
+        fetchLogs();
+        startAutoRefresh();
+    </script>
+</body>
+</html>
