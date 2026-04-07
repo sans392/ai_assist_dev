@@ -24,6 +24,7 @@ class OllamaClient:
         self,
         messages: list[dict],
         model: str | None = None,
+        options: dict | None = None,
     ) -> dict:
         """Send a chat request and return the full response."""
         payload = {
@@ -31,6 +32,8 @@ class OllamaClient:
             "messages": messages,
             "stream": False,
         }
+        if options:
+            payload["options"] = options
         logger.info("POST /api/chat model=%s messages=%d", payload["model"], len(messages))
         logger.debug("Request payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
         resp = await self._client.post("/api/chat", json=payload)
@@ -47,6 +50,7 @@ class OllamaClient:
         self,
         messages: list[dict],
         model: str | None = None,
+        options: dict | None = None,
     ) -> AsyncGenerator[str, None]:
         """Stream chat response, yielding content chunks as they arrive."""
         payload = {
@@ -54,6 +58,8 @@ class OllamaClient:
             "messages": messages,
             "stream": True,
         }
+        if options:
+            payload["options"] = options
         logger.info("POST /api/chat [stream] model=%s messages=%d", payload["model"], len(messages))
         logger.debug("Request payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
         async with self._client.stream("POST", "/api/chat", json=payload) as resp:

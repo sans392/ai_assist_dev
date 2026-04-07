@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import APIRouter, Query
 from fastapi.responses import FileResponse
 
+from app.services.agent_settings import agent_settings_store
 from app.services.log_collector import log_collector
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -20,3 +21,14 @@ async def get_logs(
     limit: int = Query(200, ge=1, le=1000),
 ):
     return {"logs": log_collector.get_entries(ollama_only=ollama_only, limit=limit)}
+
+
+@router.get("/settings")
+async def get_settings():
+    return {"settings": agent_settings_store.get_all()}
+
+
+@router.patch("/settings/{agent_name}")
+async def update_settings(agent_name: str, patch: dict):
+    updated = agent_settings_store.update(agent_name, patch)
+    return {"agent": agent_name, "settings": updated}

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin — Logs</title>
+    <title>Admin Panel</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -27,17 +27,48 @@
             gap: 10px;
         }
 
-        header h1 {
-            font-size: 15px;
-            font-weight: 600;
-            color: #fff;
+        header h1 { font-size: 15px; font-weight: 600; color: #fff; }
+
+        .nav-link {
+            color: #5599cc;
+            text-decoration: none;
+            font-size: 12px;
+        }
+        .nav-link:hover { text-decoration: underline; }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            background: #1a1a1a;
+            border-bottom: 1px solid #2a2a2a;
         }
 
+        .tab {
+            padding: 10px 20px;
+            font-size: 13px;
+            font-family: inherit;
+            color: #888;
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+        }
+
+        .tab:hover { color: #d4d4d4; }
+        .tab.active { color: #fff; border-bottom-color: #7c3aed; }
+
+        .tab-content { display: none; flex: 1; overflow: hidden; flex-direction: column; }
+        .tab-content.active { display: flex; }
+
+        /* Logs tab */
         .controls {
             display: flex;
             align-items: center;
             gap: 12px;
             flex-wrap: wrap;
+            padding: 8px 20px;
+            background: #111;
+            border-bottom: 1px solid #1a1a1a;
         }
 
         .controls label {
@@ -49,11 +80,9 @@
             cursor: pointer;
         }
 
-        .controls input[type="checkbox"] {
-            accent-color: #7c3aed;
-        }
+        .controls input[type="checkbox"] { accent-color: #7c3aed; }
 
-        .controls button {
+        .btn {
             background: #2a2a2a;
             color: #d4d4d4;
             border: 1px solid #3a3a3a;
@@ -63,14 +92,10 @@
             font-family: inherit;
             cursor: pointer;
         }
-
-        .controls button:hover { background: #3a3a3a; }
-
-        .controls button.active {
-            background: #7c3aed;
-            border-color: #7c3aed;
-            color: #fff;
-        }
+        .btn:hover { background: #3a3a3a; }
+        .btn.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+        .btn.primary { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+        .btn.primary:hover { background: #6d28d9; }
 
         .stats {
             font-size: 12px;
@@ -94,36 +119,9 @@
             white-space: pre-wrap;
             word-break: break-all;
         }
-
-        .log-entry:hover {
-            background: #111;
-        }
-
-        .log-entry.ollama {
-            border-left-color: #7c3aed;
-            background: #0f0a1a;
-        }
-
-        .log-entry .time {
-            color: #555;
-        }
-
-        .log-entry .level-DEBUG { color: #666; }
-        .log-entry .level-INFO { color: #4caf50; }
-        .log-entry .level-WARNING { color: #ff9800; }
-        .log-entry .level-ERROR { color: #f44336; }
-
-        .log-entry .logger {
-            color: #5599cc;
-        }
-
-        .log-entry .msg {
-            color: #d4d4d4;
-        }
-
-        .log-entry.ollama .msg {
-            color: #c8b0ff;
-        }
+        .log-entry:hover { background: #111; }
+        .log-entry.ollama { border-left-color: #7c3aed; background: #0f0a1a; }
+        .log-entry.ollama .msg { color: #c8b0ff; }
 
         .payload-block {
             margin: 4px 0 4px 20px;
@@ -145,41 +143,171 @@
             font-size: 14px;
         }
 
-        .nav-link {
-            color: #5599cc;
-            text-decoration: none;
-            font-size: 12px;
+        /* Settings tab */
+        .settings-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
         }
 
-        .nav-link:hover { text-decoration: underline; }
+        .agent-card {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+            max-width: 800px;
+        }
+
+        .agent-card h3 {
+            font-size: 14px;
+            color: #fff;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .agent-card h3 .badge {
+            background: #7c3aed;
+            color: #fff;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: normal;
+        }
+
+        .field-group {
+            margin-bottom: 14px;
+        }
+
+        .field-group label {
+            display: block;
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 4px;
+        }
+
+        .field-group textarea {
+            width: 100%;
+            background: #0a0a0a;
+            color: #d4d4d4;
+            border: 1px solid #3a3a3a;
+            border-radius: 6px;
+            padding: 10px;
+            font-size: 13px;
+            font-family: inherit;
+            line-height: 1.5;
+            resize: vertical;
+            min-height: 100px;
+        }
+
+        .field-group textarea:focus {
+            outline: none;
+            border-color: #7c3aed;
+        }
+
+        .options-row {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .option-field {
+            flex: 1;
+            min-width: 120px;
+        }
+
+        .option-field label {
+            display: block;
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 4px;
+        }
+
+        .option-field input {
+            width: 100%;
+            background: #0a0a0a;
+            color: #d4d4d4;
+            border: 1px solid #3a3a3a;
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 13px;
+            font-family: inherit;
+        }
+
+        .option-field input:focus {
+            outline: none;
+            border-color: #7c3aed;
+        }
+
+        .option-field .hint {
+            font-size: 10px;
+            color: #555;
+            margin-top: 2px;
+        }
+
+        .card-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .save-status {
+            font-size: 12px;
+            color: #4caf50;
+        }
     </style>
 </head>
 <body>
     <header>
         <div style="display:flex; align-items:center; gap: 16px;">
-            <h1>Admin / Logs</h1>
+            <h1>Admin Panel</h1>
             <a href="/" class="nav-link">Back to Chat</a>
         </div>
-        <div class="controls">
-            <label>
-                <input type="checkbox" id="ollama-only">
-                Ollama only
-            </label>
-            <label>
-                <input type="checkbox" id="auto-scroll" checked>
-                Auto-scroll
-            </label>
-            <button id="refresh-btn">Refresh</button>
-            <button id="auto-refresh-btn" class="active">Auto (3s)</button>
-            <button id="clear-btn">Clear view</button>
-        </div>
     </header>
-    <div class="stats" id="stats">Loading...</div>
-    <div id="logs">
-        <div class="empty-state">Waiting for logs...</div>
+
+    <div class="tabs">
+        <button class="tab active" data-tab="logs">Logs</button>
+        <button class="tab" data-tab="settings">Settings</button>
+    </div>
+
+    <!-- Logs Tab -->
+    <div class="tab-content active" id="tab-logs">
+        <div class="controls">
+            <label><input type="checkbox" id="ollama-only"> Ollama only</label>
+            <label><input type="checkbox" id="auto-scroll" checked> Auto-scroll</label>
+            <button class="btn" id="refresh-btn">Refresh</button>
+            <button class="btn active" id="auto-refresh-btn">Auto (3s)</button>
+            <button class="btn" id="clear-btn">Clear view</button>
+        </div>
+        <div class="stats" id="stats">Loading...</div>
+        <div id="logs">
+            <div class="empty-state">Waiting for logs...</div>
+        </div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div class="tab-content" id="tab-settings">
+        <div class="settings-container" id="settings-container">
+            <div class="empty-state">Loading settings...</div>
+        </div>
     </div>
 
     <script>
+        // ===== TABS =====
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+                if (tab.dataset.tab === 'settings') loadSettings();
+            });
+        });
+
+        // ===== LOGS =====
         const logsEl = document.getElementById('logs');
         const statsEl = document.getElementById('stats');
         const ollamaOnlyEl = document.getElementById('ollama-only');
@@ -199,14 +327,10 @@
         }
 
         function formatLogEntry(entry) {
-            const date = new Date(entry.timestamp * 1000);
-            const time = date.toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 1 });
-
             const msg = entry.message;
             const isOllama = entry.is_ollama;
             const cssClass = `log-entry${isOllama ? ' ollama' : ''}`;
 
-            // Check if message contains a JSON payload (Request payload)
             let html = '';
             const payloadMatch = msg.match(/Request payload:\s*(\{[\s\S]*)/);
             if (payloadMatch) {
@@ -215,7 +339,6 @@
             } else {
                 html = `<div class="${cssClass}">${escapeHtml(msg)}</div>`;
             }
-
             return html;
         }
 
@@ -229,22 +352,18 @@
                 statsEl.textContent = `${entries.length} log entries${ollamaOnly ? ' (Ollama only)' : ''} | Last updated: ${new Date().toLocaleTimeString()}`;
 
                 if (entries.length === 0) {
-                    logsEl.innerHTML = '<div class="empty-state">No logs yet. Send a message in the chat to see logs appear here.</div>';
+                    logsEl.innerHTML = '<div class="empty-state">No logs yet. Send a message in the chat to see logs here.</div>';
                     lastEntryCount = 0;
                     return;
                 }
 
-                // Only re-render if count changed
                 if (entries.length !== lastEntryCount) {
                     logsEl.innerHTML = entries.map(formatLogEntry).join('');
                     lastEntryCount = entries.length;
-
-                    if (autoScrollEl.checked) {
-                        logsEl.scrollTop = logsEl.scrollHeight;
-                    }
+                    if (autoScrollEl.checked) logsEl.scrollTop = logsEl.scrollHeight;
                 }
             } catch (err) {
-                statsEl.textContent = `Error fetching logs: ${err.message}`;
+                statsEl.textContent = `Error: ${err.message}`;
             }
         }
 
@@ -267,23 +386,113 @@
         }
 
         function stopAutoRefresh() {
-            if (autoRefreshInterval) {
-                clearInterval(autoRefreshInterval);
-                autoRefreshInterval = null;
-            }
+            if (autoRefreshInterval) { clearInterval(autoRefreshInterval); autoRefreshInterval = null; }
         }
 
         refreshBtn.addEventListener('click', () => { lastEntryCount = 0; fetchLogs(); });
         autoRefreshBtn.addEventListener('click', toggleAutoRefresh);
         clearBtn.addEventListener('click', () => {
-            logsEl.innerHTML = '<div class="empty-state">View cleared. Logs continue to accumulate on the server.</div>';
+            logsEl.innerHTML = '<div class="empty-state">View cleared.</div>';
             lastEntryCount = 0;
         });
         ollamaOnlyEl.addEventListener('change', () => { lastEntryCount = 0; fetchLogs(); });
 
-        // Initial load
         fetchLogs();
         startAutoRefresh();
+
+        // ===== SETTINGS =====
+        const settingsContainer = document.getElementById('settings-container');
+
+        const OPTION_HINTS = {
+            temperature: '0.0 = precise, 1.0 = creative',
+            top_p: '0.0–1.0, lower = more focused',
+            num_ctx: 'Context window size in tokens',
+        };
+
+        async function loadSettings() {
+            try {
+                const resp = await fetch('/admin/settings');
+                const data = await resp.json();
+                renderSettings(data.settings);
+            } catch (err) {
+                settingsContainer.innerHTML = `<div class="empty-state">Error: ${err.message}</div>`;
+            }
+        }
+
+        function renderSettings(settings) {
+            settingsContainer.innerHTML = '';
+            for (const [agentName, config] of Object.entries(settings)) {
+                const card = document.createElement('div');
+                card.className = 'agent-card';
+                card.innerHTML = `
+                    <h3><span class="badge">${agentName}</span> Agent Settings</h3>
+                    <div class="field-group">
+                        <label>System Prompt</label>
+                        <textarea id="prompt-${agentName}" rows="6">${escapeHtml(config.system_prompt || '')}</textarea>
+                    </div>
+                    <div class="field-group">
+                        <label>Model Options</label>
+                        <div class="options-row">
+                            ${renderOptionFields(agentName, config.options || {})}
+                        </div>
+                    </div>
+                    <div class="card-actions">
+                        <button class="btn primary" onclick="saveAgent('${agentName}')">Save</button>
+                        <span class="save-status" id="status-${agentName}"></span>
+                    </div>
+                `;
+                settingsContainer.appendChild(card);
+            }
+        }
+
+        function renderOptionFields(agentName, options) {
+            const fields = ['temperature', 'top_p', 'num_ctx'];
+            return fields.map(field => {
+                const value = options[field] !== undefined ? options[field] : '';
+                const step = field === 'num_ctx' ? '256' : '0.05';
+                const hint = OPTION_HINTS[field] || '';
+                return `
+                    <div class="option-field">
+                        <label>${field}</label>
+                        <input type="number" step="${step}" id="opt-${agentName}-${field}" value="${value}">
+                        <div class="hint">${hint}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function saveAgent(agentName) {
+            const statusEl = document.getElementById(`status-${agentName}`);
+            statusEl.textContent = 'Saving...';
+            statusEl.style.color = '#888';
+
+            const prompt = document.getElementById(`prompt-${agentName}`).value;
+            const options = {};
+
+            for (const field of ['temperature', 'top_p', 'num_ctx']) {
+                const input = document.getElementById(`opt-${agentName}-${field}`);
+                if (input.value !== '') {
+                    options[field] = field === 'num_ctx' ? parseInt(input.value) : parseFloat(input.value);
+                }
+            }
+
+            try {
+                const resp = await fetch(`/admin/settings/${agentName}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ system_prompt: prompt, options }),
+                });
+
+                if (!resp.ok) throw new Error('Save failed');
+
+                statusEl.textContent = 'Saved!';
+                statusEl.style.color = '#4caf50';
+                setTimeout(() => { statusEl.textContent = ''; }, 3000);
+            } catch (err) {
+                statusEl.textContent = `Error: ${err.message}`;
+                statusEl.style.color = '#f44336';
+            }
+        }
     </script>
 </body>
 </html>
