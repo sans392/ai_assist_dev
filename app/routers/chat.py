@@ -37,11 +37,12 @@ async def chat(
     prepared = agent.prepare_messages(history)
 
     options = agent.model_options
+    model = agent.model
 
     if request.stream:
-        return _stream_response(ollama, prepared, agent.name, conversation_id, store, options)
+        return _stream_response(ollama, prepared, agent.name, conversation_id, store, options, model)
 
-    result = await ollama.chat(prepared, options=options)
+    result = await ollama.chat(prepared, model=model, options=options)
 
     # Save assistant reply
     assistant_msg = {"role": result["role"], "content": result["content"]}
@@ -62,10 +63,11 @@ def _stream_response(
     conversation_id: str,
     store: ConversationStore,
     options: dict | None = None,
+    model: str | None = None,
 ) -> StreamingResponse:
     async def event_generator():
         full_content = ""
-        async for chunk in ollama.chat_stream(prepared, options=options):
+        async for chunk in ollama.chat_stream(prepared, model=model, options=options):
             full_content += chunk
             event = json.dumps({"content": chunk, "done": False})
             yield f"data: {event}\n\n"

@@ -74,6 +74,16 @@ class OllamaClient:
                 if data.get("done"):
                     break
 
+    async def list_models(self) -> list[str]:
+        """Return list of available model names."""
+        try:
+            resp = await self._client.get("/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            return [m["name"] for m in data.get("models", [])]
+        except httpx.HTTPError:
+            return []
+
     async def is_healthy(self) -> bool:
         """Check if Ollama is reachable."""
         try:

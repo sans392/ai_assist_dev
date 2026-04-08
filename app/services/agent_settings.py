@@ -32,6 +32,8 @@ class AgentSettingsStore:
 
         if "system_prompt" in patch:
             settings["system_prompt"] = patch["system_prompt"]
+        if "model" in patch:
+            settings["model"] = patch["model"]
         if "options" in patch and isinstance(patch["options"], dict):
             settings.setdefault("options", {})
             settings["options"].update(patch["options"])

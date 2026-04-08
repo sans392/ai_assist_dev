@@ -273,6 +273,16 @@
 
         sendBtn.addEventListener('click', sendMessage);
 
+        // Reset conversation on mode change
+        modeEl.addEventListener('change', () => {
+            conversationId = null;
+            chatEl.innerHTML = `
+                <div class="welcome">
+                    <h2>AI Assistant</h2>
+                    <p>Mode changed to ${modeEl.options[modeEl.selectedIndex].text}. New conversation started.</p>
+                </div>`;
+        });
+
         // Check Ollama connection
         async function checkHealth() {
             try {

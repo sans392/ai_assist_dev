@@ -225,7 +225,8 @@
             margin-bottom: 4px;
         }
 
-        .option-field input {
+        .option-field input,
+        .option-field select {
             width: 100%;
             background: #0a0a0a;
             color: #d4d4d4;
@@ -236,7 +237,8 @@
             font-family: inherit;
         }
 
-        .option-field input:focus {
+        .option-field input:focus,
+        .option-field select:focus {
             outline: none;
             border-color: #7c3aed;
         }
@@ -409,14 +411,37 @@
             num_ctx: 'Context window size in tokens',
         };
 
+        let availableModels = [];
+
         async function loadSettings() {
             try {
-                const resp = await fetch('/admin/settings');
-                const data = await resp.json();
-                renderSettings(data.settings);
+                const [settingsResp, modelsResp] = await Promise.all([
+                    fetch('/admin/settings'),
+                    fetch('/admin/models'),
+                ]);
+                const settingsData = await settingsResp.json();
+                const modelsData = await modelsResp.json();
+                availableModels = modelsData.models || [];
+                renderSettings(settingsData.settings);
             } catch (err) {
                 settingsContainer.innerHTML = `<div class="empty-state">Error: ${err.message}</div>`;
             }
+        }
+
+        function renderModelSelect(agentName, currentModel) {
+            const options = availableModels.map(m => {
+                const selected = m === currentModel ? 'selected' : '';
+                return `<option value="${m}" ${selected}>${m}</option>`;
+            }).join('');
+            return `
+                <div class="option-field">
+                    <label>model</label>
+                    <select id="model-${agentName}">
+                        ${options}
+                    </select>
+                    <div class="hint">Ollama model for this agent</div>
+                </div>
+            `;
         }
 
         function renderSettings(settings) {
@@ -431,8 +456,9 @@
                         <textarea id="prompt-${agentName}" rows="6">${escapeHtml(config.system_prompt || '')}</textarea>
                     </div>
                     <div class="field-group">
-                        <label>Model Options</label>
+                        <label>Model & Options</label>
                         <div class="options-row">
+                            ${renderModelSelect(agentName, config.model || '')}
                             ${renderOptionFields(agentName, config.options || {})}
                         </div>
                     </div>
@@ -467,6 +493,7 @@
             statusEl.style.color = '#888';
 
             const prompt = document.getElementById(`prompt-${agentName}`).value;
+            const model = document.getElementById(`model-${agentName}`).value;
             const options = {};
 
             for (const field of ['temperature', 'top_p', 'num_ctx']) {
@@ -480,7 +507,7 @@
                 const resp = await fetch(`/admin/settings/${agentName}`, {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ system_prompt: prompt, options }),
+                    body: JSON.stringify({ system_prompt: prompt, model, options }),
                 });
 
                 if (!resp.ok) throw new Error('Save failed');

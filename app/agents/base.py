@@ -10,6 +10,12 @@ class BaseAgent(ABC):
     default_system_prompt: str
 
     @property
+    def model(self) -> str | None:
+        """Return model override for this agent, or None for default."""
+        settings = agent_settings_store.get(self.name)
+        return settings.get("model")
+
+    @property
     def system_prompt(self) -> str:
         """Return system prompt: custom from settings or default."""
         settings = agent_settings_store.get(self.name)
