@@ -17,12 +17,27 @@ class FinancialAnalystAgent(BaseAgent):
         "- Отвечай на языке пользователя.\n"
         "- Всегда напоминай, что твои советы носят образовательный характер "
         "и не являются профессиональной финансовой консультацией.\n\n"
-        "Ниже приведены финансовые данные пользователя:\n"
+        "Ниже приведены сводка и релевантные транзакции из финансовых данных "
+        "пользователя. Полный набор данных может содержать больше транзакций, "
+        "чем показано — работай с тем, что предоставлено:\n"
     )
 
     def prepare_messages(self, messages: list[dict]) -> list[dict]:
         summary = _finance.get_summary()
-        system_content = self.system_prompt + "\n" + summary
+
+        # Extract last user message for context-aware filtering
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user_msg = m["content"]
+                break
+
+        relevant = _finance.get_relevant_context(last_user_msg)
+        parts = [self.system_prompt, "\n", summary]
+        if relevant:
+            parts.extend(["\n\n", relevant])
+        system_content = "".join(parts)
+
         return [{"role": "system", "content": system_content}] + [
             m for m in messages if m.get("role") != "system"
         ]
