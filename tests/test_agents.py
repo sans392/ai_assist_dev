@@ -23,7 +23,7 @@ def test_financial_agent_has_system_prompt():
     agent = FinancialAnalystAgent()
     messages = [{"role": "user", "content": "Show expenses"}]
     result = agent.prepare_messages(messages)
-    assert "financial" in result[0]["content"].lower()
+    assert "ФИНАНСОВАЯ СВОДКА" in result[0]["content"]
 
 
 def test_get_agent_by_mode():
