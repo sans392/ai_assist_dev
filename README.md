@@ -32,9 +32,10 @@ Send a chat message. Supports `mode` selection (`general`, `financial`) and stre
 
 ```json
 {
-  "messages": [{"role": "user", "content": "Hello!"}],
+  "message": "Hello!",
   "mode": "general",
-  "stream": false
+  "stream": false,
+  "conversation_id": null
 }
 ```
 
@@ -54,8 +55,11 @@ app/
 ├── main.py           # FastAPI app, lifespan, CORS
 ├── config.py         # Settings from environment
 ├── dependencies.py   # FastAPI dependency injection
-├── routers/          # API endpoints (chat, health)
-├── services/         # Ollama client, conversation store
+├── routers/          # API endpoints (chat, health, admin)
+├── services/         # Ollama client, conversation store, finance analytics
 ├── agents/           # Agent modes (general, financial)
 └── models/           # Pydantic schemas
+data/
+├── transactions.json     # Financial transaction data (1000+ records)
+└── agent_defaults.json   # Per-agent settings (model, prompt, options)
 ```

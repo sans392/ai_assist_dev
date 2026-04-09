@@ -31,7 +31,7 @@ app/
 - **Server-side conversation history**: Frontend sends only `message` + `conversation_id`. Server stores full history in ConversationStore (in-memory dict). History resets on mode switch.
 - **Per-agent settings**: system_prompt, model, options (temperature, top_p, num_ctx) — stored in AgentSettingsStore, editable via admin panel at runtime, defaults from `data/agent_defaults.json`.
 - **Streaming**: SSE (Server-Sent Events) via `StreamingResponse`, not WebSocket.
-- **Financial agent**: injects full transaction summary into system prompt. Data from `data/transactions.json`.
+- **Financial agent**: pre-computes analytics in Python (sums, breakdowns, time-of-day stats) and injects results into system prompt. LLM presents data, never calculates. Supports relative dates ("прошлый месяц"), description search ("стоматолог"), loan detection, savings advice. Data from `data/transactions.json`.
 - **Prompts in Russian** for better quality with small models (8b).
 
 ## Commands
