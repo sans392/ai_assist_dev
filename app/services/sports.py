@@ -25,7 +25,7 @@ from app.models.health_schemas import (
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "Health_metrics_example_data"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "Health_metrics_example_data"
 
 ACTIVITIES_FILE = DATA_DIR / "activities.json"
 DAILY_FACTS_FILE = DATA_DIR / "daily-facts.json"
