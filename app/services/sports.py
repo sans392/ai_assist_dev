@@ -96,6 +96,27 @@ def _sport_ru(sport: str) -> str:
     return _SPORT_NAMES_RU.get(sport, sport)
 
 
+def _recovery_trend(values: list[float]) -> str:
+    """Determine trend from most-recent-first recovery values.
+
+    Values arrive newest-first (e.g. [43, 42, 34, 53, 55]).
+    We reverse to chronological order and compare the first half average
+    to the second half average.
+    """
+    if len(values) < 2:
+        return "недостаточно данных"
+    chronological = list(reversed(values))
+    mid = len(chronological) // 2
+    first_half = sum(chronological[:mid]) / mid
+    second_half = sum(chronological[mid:]) / len(chronological[mid:])
+    diff = second_half - first_half
+    if diff > 3:
+        return "↑ растёт"
+    if diff < -3:
+        return "↓ снижается"
+    return "→ стабильный"
+
+
 class SportsService:
     def __init__(self) -> None:
         self._activities: list[Activity] = []
@@ -273,7 +294,14 @@ class SportsService:
     # ------------------------------------------------------------------
 
     def get_summary(self) -> str:
-        """Compact summary for system prompt."""
+        """Compact summary for system prompt.
+
+        Always included — gives LLM context about available data:
+        - Steps totals for last 7 days + average
+        - Training count by sport type (last 7 / 30 days)
+        - Latest recovery score + trend (last 5 non-null)
+        - Date range of available data
+        """
         if not self._daily_facts and not self._activities:
             return "Данные о здоровье и тренировках отсутствуют."
 
@@ -281,10 +309,54 @@ class SportsService:
         lines = ["--- СВОДКА ПО ДАННЫМ ---"]
         lines.append(f"Сегодняшняя дата: {self._today.isoformat()}")
         lines.append(f"Период данных: {report.date_range_start} — {report.date_range_end}")
-        lines.append(f"Тренировок загружено: {report.activities_loaded}")
-        lines.append(f"Виды спорта: {', '.join(report.sport_types)}")
-        lines.append(f"Дней с метриками: {report.daily_facts_loaded}")
         lines.append(f"Доступные метрики: {', '.join(report.available_metrics)}")
+
+        # --- Steps: last 7 days ---
+        week_ago = self._today - timedelta(days=7)
+        recent_facts = [
+            f for f in self._daily_facts
+            if week_ago <= f.isoDate <= self._today and f.steps > 0
+        ]
+        if recent_facts:
+            steps_total = sum(f.steps for f in recent_facts)
+            steps_avg = steps_total // len(recent_facts)
+            lines.append(f"Шаги за последние 7 дней: {steps_total} "
+                         f"(среднее {steps_avg}/день, дней с данными: {len(recent_facts)})")
+        else:
+            lines.append("Шаги за последние 7 дней: нет данных")
+
+        # --- Trainings by sport type: last 7 / 30 days ---
+        clean = self.clean_activities
+        week_acts = [a for a in clean if week_ago <= a.startTime.date() <= self._today]
+        month_ago = self._today - timedelta(days=30)
+        month_acts = [a for a in clean if month_ago <= a.startTime.date() <= self._today]
+
+        def _sport_counts(acts: list[Activity]) -> str:
+            if not acts:
+                return "0"
+            by_sport: dict[str, int] = defaultdict(int)
+            for a in acts:
+                by_sport[a.sportType] += 1
+            parts = [f"{_sport_ru(s)}: {c}" for s, c in sorted(by_sport.items(), key=lambda x: -x[1])]
+            return f"{len(acts)} ({', '.join(parts)})"
+
+        lines.append(f"Тренировок за 7 дней: {_sport_counts(week_acts)}")
+        lines.append(f"Тренировок за 30 дней: {_sport_counts(month_acts)}")
+
+        # --- Latest recovery score + trend (last 5 non-null) ---
+        facts_by_date = sorted(self._daily_facts, key=lambda f: f.isoDate, reverse=True)
+        recent_recovery = [
+            f.recoveryScore for f in facts_by_date
+            if f.recoveryScore is not None
+        ][:5]
+        if recent_recovery:
+            trend = _recovery_trend(recent_recovery)
+            vals_str = ", ".join(f"{v:.0f}%" for v in recent_recovery)
+            lines.append(f"Recovery score (последние {len(recent_recovery)}): "
+                         f"{vals_str} → тренд: {trend}")
+        else:
+            lines.append("Recovery score: нет данных")
+
         return "\n".join(lines)
 
     def get_analytics(self, user_message: str) -> str:
@@ -348,6 +420,11 @@ class SportsService:
         return found
 
     def _detect_date_range(self, text: str) -> tuple[date, date] | None:
+        # "вчера"
+        if "вчера" in text:
+            yesterday = self._today - timedelta(days=1)
+            return (yesterday, yesterday)
+
         # "последние N дней"
         m = re.search(r"последн\w*\s+(\d+)\s*дн", text)
         if m:
@@ -627,11 +704,17 @@ class SportsService:
         vals = [f.recoveryScore for f in with_recovery]
         avg = sum(vals) / len(vals)
 
+        # Trend from last 5 values (chronological order, newest last in with_recovery)
+        last_5 = [f.recoveryScore for f in with_recovery[-5:]]
+        # _recovery_trend expects newest-first, so reverse
+        trend = _recovery_trend(list(reversed(last_5)))
+
         lines = ["--- АНАЛИЗ ВОССТАНОВЛЕНИЯ ---"]
         lines.append(f"Дней с данными: {len(with_recovery)}")
         lines.append(f"Средний recovery score: {avg:.0f}%")
         lines.append(f"Максимум: {max(vals):.0f}%")
         lines.append(f"Минимум: {min(vals):.0f}%")
+        lines.append(f"Тренд (последние {len(last_5)} значений): {trend}")
 
         # Categorize days
         low = sum(1 for v in vals if v < 34)

@@ -8,7 +8,12 @@ from pydantic import ValidationError
 from app.agents import get_agent_by_mode
 from app.agents.sports import SportsAgent
 from app.models.health_schemas import Activity, ActivityFlag, DailyFact, HealthDay
-from app.services.sports import SportsService, _fmt_duration, _fmt_distance
+from app.services.sports import (
+    SportsService,
+    _fmt_duration,
+    _fmt_distance,
+    _recovery_trend,
+)
 
 
 # ---------------------------------------------------------------
@@ -356,6 +361,12 @@ class TestIntentDetectors:
         assert dr[0] == date(2026, 2, 1)
         assert dr[1] == date(2026, 2, 28)
 
+    def test_detect_date_range_yesterday(self):
+        dr = self.svc._detect_date_range("что было вчера?")
+        assert dr is not None
+        assert dr[0] == date(2026, 3, 16)
+        assert dr[1] == date(2026, 3, 16)
+
     def test_detect_date_range_none(self):
         assert self.svc._detect_date_range("привет") is None
 
@@ -469,20 +480,84 @@ class TestAnalyticsBuilders:
 
 
 # ---------------------------------------------------------------
-# Stage 2: Summary includes today's date
+# Stage 2: Recovery trend helper
+# ---------------------------------------------------------------
+
+class TestRecoveryTrend:
+    def test_trend_rising(self):
+        # Newest-first: [50, 45, 40, 30, 20] → chrono [20, 30, 40, 45, 50] → rising
+        assert "растёт" in _recovery_trend([50, 45, 40, 30, 20])
+
+    def test_trend_falling(self):
+        # Newest-first: [20, 25, 40, 50, 55] → chrono [55, 50, 40, 25, 20] → falling
+        assert "снижается" in _recovery_trend([20, 25, 40, 50, 55])
+
+    def test_trend_stable(self):
+        assert "стабильный" in _recovery_trend([42, 43, 41, 42, 43])
+
+    def test_trend_insufficient_data(self):
+        assert "недостаточно" in _recovery_trend([42])
+
+
+# ---------------------------------------------------------------
+# Stage 2: Summary per issue #6 spec
 # ---------------------------------------------------------------
 
 class TestSummaryStage2:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 17)
+
     def test_summary_includes_date(self):
-        svc = SportsService()
-        svc._today = date(2026, 3, 17)
-        summary = svc.get_summary()
+        summary = self.svc.get_summary()
         assert "2026-03-17" in summary
 
     def test_summary_includes_available_metrics(self):
-        svc = SportsService()
-        summary = svc.get_summary()
+        summary = self.svc.get_summary()
         assert "Доступные метрики" in summary
+
+    def test_summary_includes_steps_last_7_days(self):
+        summary = self.svc.get_summary()
+        assert "Шаги за последние 7 дней" in summary
+
+    def test_summary_includes_training_counts(self):
+        summary = self.svc.get_summary()
+        assert "Тренировок за 7 дней" in summary
+        assert "Тренировок за 30 дней" in summary
+
+    def test_summary_includes_recovery_trend(self):
+        summary = self.svc.get_summary()
+        assert "Recovery score" in summary
+        assert "тренд" in summary
+
+    def test_summary_includes_date_range(self):
+        summary = self.svc.get_summary()
+        assert "Период данных" in summary
+
+
+# ---------------------------------------------------------------
+# Stage 2: Recovery analysis includes trend
+# ---------------------------------------------------------------
+
+class TestRecoveryAnalysisTrend:
+    def test_recovery_analysis_has_trend(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 17)
+        result = svc._build_recovery_analysis(None)
+        assert "Тренд" in result
+
+
+# ---------------------------------------------------------------
+# Stage 2: "вчера" date range in analytics
+# ---------------------------------------------------------------
+
+class TestYesterdayAnalytics:
+    def test_analytics_yesterday(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 17)
+        result = svc.get_analytics("что было вчера?")
+        # Should produce daily metrics for 2026-03-16 only
+        assert "ДНЕВНЫЕ МЕТРИКИ" in result
 
 
 # ---------------------------------------------------------------
