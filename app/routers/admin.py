@@ -7,6 +7,7 @@ from app.dependencies import get_ollama_client
 from app.services.agent_settings import agent_settings_store
 from app.services.log_collector import log_collector
 from app.services.ollama import OllamaClient
+from app.services.sports import sports_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
@@ -40,3 +41,9 @@ async def get_settings():
 async def update_settings(agent_name: str, patch: dict):
     updated = agent_settings_store.update(agent_name, patch)
     return {"agent": agent_name, "settings": updated}
+
+
+@router.get("/health-data-status")
+async def health_data_status():
+    report = sports_service.load_report
+    return report.model_dump()
