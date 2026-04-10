@@ -1,9 +1,11 @@
 from app.agents.general import GeneralAgent
 from app.agents.financial import FinancialAnalystAgent
+from app.agents.sports import SportsAgent
 
 AGENT_REGISTRY: dict[str, type] = {
     "general": GeneralAgent,
     "financial": FinancialAnalystAgent,
+    "sports": SportsAgent,
 }
 
 
