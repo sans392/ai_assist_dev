@@ -1,4 +1,6 @@
-"""Tests for Sports Assistant — Stage 1: data loading, validation, agent skeleton."""
+"""Tests for Sports Assistant — Stages 1 & 2: data loading, validation, analytics."""
+
+from datetime import date
 
 import pytest
 from pydantic import ValidationError
@@ -6,7 +8,7 @@ from pydantic import ValidationError
 from app.agents import get_agent_by_mode
 from app.agents.sports import SportsAgent
 from app.models.health_schemas import Activity, ActivityFlag, DailyFact, HealthDay
-from app.services.sports import SportsService
+from app.services.sports import SportsService, _fmt_duration, _fmt_distance
 
 
 # ---------------------------------------------------------------
@@ -266,3 +268,238 @@ async def test_health_data_status_endpoint(client):
     assert data["daily_facts_loaded"] > 0
     assert isinstance(data["available_metrics"], list)
     assert isinstance(data["sport_types"], list)
+
+
+# ---------------------------------------------------------------
+# Stage 2: Formatting helpers
+# ---------------------------------------------------------------
+
+class TestFormatters:
+    def test_fmt_duration_seconds(self):
+        assert _fmt_duration(45) == "45 сек"
+
+    def test_fmt_duration_minutes(self):
+        assert _fmt_duration(600) == "10 мин"
+
+    def test_fmt_duration_hours_and_minutes(self):
+        assert _fmt_duration(5400) == "1 ч 30 мин"
+
+    def test_fmt_duration_exact_hours(self):
+        assert _fmt_duration(7200) == "2 ч"
+
+    def test_fmt_distance_meters(self):
+        assert _fmt_distance(500) == "500 м"
+
+    def test_fmt_distance_kilometers(self):
+        assert _fmt_distance(5000) == "5.0 км"
+
+    def test_fmt_distance_fractional_km(self):
+        assert _fmt_distance(2750) == "2.8 км"
+
+
+# ---------------------------------------------------------------
+# Stage 2: Intent detectors
+# ---------------------------------------------------------------
+
+class TestIntentDetectors:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 17)
+
+    def test_detect_sport_running(self):
+        assert "running" in self.svc._detect_sport_types("мои пробежки за март")
+
+    def test_detect_sport_cycling(self):
+        assert "cycling" in self.svc._detect_sport_types("статистика по велосипеду")
+
+    def test_detect_sport_multiple(self):
+        types = self.svc._detect_sport_types("бег и велосипед")
+        assert "running" in types
+        assert "cycling" in types
+
+    def test_detect_no_sport(self):
+        assert self.svc._detect_sport_types("как дела?") == set()
+
+    def test_detect_date_range_last_n_days(self):
+        dr = self.svc._detect_date_range("последние 7 дней")
+        assert dr is not None
+        assert dr[0] == date(2026, 3, 10)
+        assert dr[1] == date(2026, 3, 17)
+
+    def test_detect_date_range_za_n_days(self):
+        dr = self.svc._detect_date_range("за 14 дней")
+        assert dr is not None
+        assert dr[0] == date(2026, 3, 3)
+
+    def test_detect_date_range_last_week(self):
+        dr = self.svc._detect_date_range("прошлая неделя")
+        assert dr is not None
+        # 2026-03-17 is Tuesday, last Monday = 2026-03-09
+        assert dr[0] == date(2026, 3, 9)
+        assert dr[1] == date(2026, 3, 15)
+
+    def test_detect_date_range_this_week(self):
+        dr = self.svc._detect_date_range("эта неделя")
+        assert dr is not None
+        assert dr[0] == date(2026, 3, 16)  # Monday
+        assert dr[1] == date(2026, 3, 17)
+
+    def test_detect_date_range_month_name(self):
+        dr = self.svc._detect_date_range("статистика за март")
+        assert dr is not None
+        assert dr[0] == date(2026, 3, 1)
+        assert dr[1] == date(2026, 3, 31)
+
+    def test_detect_date_range_february(self):
+        dr = self.svc._detect_date_range("февраль")
+        assert dr is not None
+        assert dr[0] == date(2026, 2, 1)
+        assert dr[1] == date(2026, 2, 28)
+
+    def test_detect_date_range_none(self):
+        assert self.svc._detect_date_range("привет") is None
+
+    def test_wants_full_analysis(self):
+        assert self.svc._wants_full_analysis("покажи полный анализ")
+        assert not self.svc._wants_full_analysis("привет")
+
+    def test_wants_recovery(self):
+        assert self.svc._wants_recovery("как моё восстановление?")
+        assert not self.svc._wants_recovery("привет")
+
+    def test_wants_steps(self):
+        assert self.svc._wants_steps("сколько шагов я прошёл?")
+        assert not self.svc._wants_steps("привет")
+
+    def test_wants_calories(self):
+        assert self.svc._wants_calories("сколько калорий я сжёг?")
+        assert not self.svc._wants_calories("привет")
+
+    def test_wants_activities(self):
+        assert self.svc._wants_activities("покажи мои тренировки")
+        assert not self.svc._wants_activities("привет")
+
+
+# ---------------------------------------------------------------
+# Stage 2: Analytics builders
+# ---------------------------------------------------------------
+
+class TestAnalyticsBuilders:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 17)
+
+    def test_get_analytics_fallback(self):
+        result = self.svc.get_analytics("привет")
+        assert "ПОСЛЕДНИЕ 7 ДНЕЙ" in result
+
+    def test_get_analytics_full_analysis(self):
+        result = self.svc.get_analytics("покажи полный анализ")
+        assert "СВОДКА ПО ДАННЫМ" in result
+        assert "РАЗБИВКА ПО ВИДАМ СПОРТА" in result
+        assert "ДНЕВНЫЕ МЕТРИКИ" in result
+        assert "АНАЛИЗ ВОССТАНОВЛЕНИЯ" in result
+
+    def test_get_analytics_running(self):
+        result = self.svc.get_analytics("мои пробежки")
+        assert "ТРЕНИРОВКИ" in result
+        assert "Бег" in result
+
+    def test_get_analytics_cycling(self):
+        result = self.svc.get_analytics("велосипед тренировки")
+        assert "ТРЕНИРОВКИ" in result
+        assert "Велосипед" in result
+
+    def test_get_analytics_recovery(self):
+        result = self.svc.get_analytics("как моё восстановление?")
+        assert "АНАЛИЗ ВОССТАНОВЛЕНИЯ" in result
+        assert "recovery score" in result
+
+    def test_get_analytics_steps(self):
+        result = self.svc.get_analytics("сколько шагов?")
+        assert "АНАЛИЗ ШАГОВ" in result
+        assert "шагов/день" in result
+
+    def test_get_analytics_calories(self):
+        result = self.svc.get_analytics("сколько калорий я сжёг?")
+        assert "АНАЛИЗ КАЛОРИЙ" in result
+        assert "ккал" in result
+
+    def test_get_analytics_activities(self):
+        result = self.svc.get_analytics("покажи мои тренировки")
+        assert "ТРЕНИРОВКИ" in result
+        assert "тренировок:" in result
+
+    def test_get_analytics_date_range(self):
+        result = self.svc.get_analytics("последние 14 дней")
+        assert "ДНЕВНЫЕ МЕТРИКИ" in result
+
+    def test_activity_summary_no_results(self):
+        result = self.svc._build_activity_summary(
+            {"swimming"}, (date(2026, 1, 1), date(2026, 1, 2)),
+        )
+        assert "не найдены" in result
+
+    def test_recovery_no_data(self):
+        result = self.svc._build_recovery_analysis(
+            (date(2020, 1, 1), date(2020, 1, 2)),
+        )
+        assert "отсутствуют" in result
+
+    def test_steps_no_data(self):
+        result = self.svc._build_steps_analysis(
+            (date(2020, 1, 1), date(2020, 1, 2)),
+        )
+        assert "отсутствуют" in result
+
+    def test_calories_no_data(self):
+        result = self.svc._build_calories_analysis(
+            (date(2020, 1, 1), date(2020, 1, 2)),
+        )
+        assert "отсутствуют" in result
+
+    def test_sport_breakdown(self):
+        result = self.svc._build_sport_breakdown()
+        assert "РАЗБИВКА ПО ВИДАМ СПОРТА" in result
+        assert "Бег" in result
+
+    def test_recent_summary(self):
+        result = self.svc._build_recent_summary()
+        assert "ПОСЛЕДНИЕ 7 ДНЕЙ" in result
+
+
+# ---------------------------------------------------------------
+# Stage 2: Summary includes today's date
+# ---------------------------------------------------------------
+
+class TestSummaryStage2:
+    def test_summary_includes_date(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 17)
+        summary = svc.get_summary()
+        assert "2026-03-17" in summary
+
+    def test_summary_includes_available_metrics(self):
+        svc = SportsService()
+        summary = svc.get_summary()
+        assert "Доступные метрики" in summary
+
+
+# ---------------------------------------------------------------
+# Stage 2: Agent injects analytics
+# ---------------------------------------------------------------
+
+class TestSportsAgentStage2:
+    def test_agent_injects_analytics_for_sport_query(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "покажи мои пробежки"}]
+        result = agent.prepare_messages(messages)
+        system_content = result[0]["content"]
+        assert "ТРЕНИРОВКИ" in system_content
+
+    def test_agent_injects_analytics_for_recovery_query(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "как моё восстановление?"}]
+        result = agent.prepare_messages(messages)
+        system_content = result[0]["content"]
+        assert "ВОССТАНОВЛЕН" in system_content
