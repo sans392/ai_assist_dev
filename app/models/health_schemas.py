@@ -119,6 +119,8 @@ class DataLoadReport(BaseModel):
     activities_loaded: int = 0
     activities_skipped: int = 0
     activities_flagged: int = 0
+    activities_unique: int = 0
+    activities_duplicates_removed: int = 0
     daily_facts_loaded: int = 0
     daily_facts_skipped: int = 0
     health_days_loaded: int = 0

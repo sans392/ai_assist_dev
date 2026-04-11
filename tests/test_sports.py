@@ -1,6 +1,6 @@
-"""Tests for Sports Assistant — Stage 1 + Stage 2 Level A analytics."""
+"""Tests for Sports Assistant — Stage 1 + Stage 2 + Stage 3 analytics."""
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -8,7 +8,15 @@ from pydantic import ValidationError
 from app.agents import get_agent_by_mode
 from app.agents.sports import SportsAgent
 from app.models.health_schemas import Activity, ActivityFlag, DailyFact, HealthDay
-from app.services.sports import SportsService, _compute_trend
+from app.services.sports import (
+    SportsService,
+    _activity_source,
+    _are_duplicates,
+    _compute_trend,
+    _deduplicate,
+    _overlap_seconds,
+    _pick_canonical,
+)
 
 
 # ---------------------------------------------------------------
@@ -632,3 +640,496 @@ async def test_health_data_status_endpoint(client):
     assert data["daily_facts_loaded"] > 0
     assert isinstance(data["available_metrics"], list)
     assert isinstance(data["sport_types"], list)
+    # Stage 3: dedup stats exposed
+    assert "activities_unique" in data
+    assert "activities_duplicates_removed" in data
+    assert data["activities_unique"] <= data["activities_loaded"]
+
+
+# ===============================================================
+# STAGE 3: Level B analytics (deduplication + cross-file logic)
+# ===============================================================
+
+
+def _mk_activity(
+    id_: str,
+    title: str,
+    sport: str,
+    start: str,
+    duration: int,
+    distance: float = 0,
+    calories: float = 0,
+) -> Activity:
+    """Helper: build a minimal Activity from a start-time + duration."""
+    start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    end_dt = start_dt.fromtimestamp(
+        start_dt.timestamp() + duration, tz=timezone.utc,
+    )
+    return Activity.model_validate(
+        {
+            "id": id_,
+            "title": title,
+            "sportType": sport,
+            "distance": distance,
+            "duration": duration,
+            "startTime": start_dt.isoformat(),
+            "endTime": end_dt.isoformat(),
+            "calories": calories,
+        }
+    )
+
+
+class TestActivitySource:
+    def test_whoop_detected(self):
+        a = _mk_activity("x", "WHOOP • running", "running",
+                         "2026-03-03T10:00:00Z", 600)
+        assert _activity_source(a) == "whoop"
+
+    def test_apple_detected(self):
+        a = _mk_activity("x", "Apple Health Workout", "running",
+                         "2026-03-03T10:00:00Z", 600)
+        assert _activity_source(a) == "apple_health"
+
+    def test_manual_default(self):
+        a = _mk_activity("x", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 600)
+        assert _activity_source(a) == "manual"
+
+    def test_empty_title_is_manual(self):
+        a = _mk_activity("x", "", "running",
+                         "2026-03-03T10:00:00Z", 600)
+        assert _activity_source(a) == "manual"
+
+
+class TestOverlapSeconds:
+    def test_no_overlap(self):
+        a = _mk_activity("a", "A", "running",
+                         "2026-03-03T10:00:00Z", 600)
+        b = _mk_activity("b", "B", "running",
+                         "2026-03-03T11:00:00Z", 600)
+        assert _overlap_seconds(a, b) == 0
+
+    def test_full_containment(self):
+        a = _mk_activity("a", "A", "running",
+                         "2026-03-03T10:00:00Z", 3600)
+        b = _mk_activity("b", "B", "running",
+                         "2026-03-03T10:10:00Z", 600)
+        assert _overlap_seconds(a, b) == 600
+
+    def test_partial_overlap(self):
+        a = _mk_activity("a", "A", "running",
+                         "2026-03-03T10:00:00Z", 1800)  # 10:00-10:30
+        b = _mk_activity("b", "B", "running",
+                         "2026-03-03T10:20:00Z", 1800)  # 10:20-10:50
+        assert _overlap_seconds(a, b) == 600  # 10 min overlap
+
+
+class TestAreDuplicates:
+    def test_different_sport_not_duplicate(self):
+        a = _mk_activity("a", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 1800)
+        b = _mk_activity("b", "WHOOP • cycling", "cycling",
+                         "2026-03-03T10:00:00Z", 1800)
+        assert _are_duplicates(a, b) is False
+
+    def test_different_day_not_duplicate(self):
+        a = _mk_activity("a", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 1800)
+        b = _mk_activity("b", "Бег", "running",
+                         "2026-03-04T10:00:00Z", 1800)
+        assert _are_duplicates(a, b) is False
+
+    def test_full_containment_is_duplicate(self):
+        """Short activity fully inside a longer one on the same day/sport."""
+        a = _mk_activity("a", "Бег", "running",
+                         "2026-03-03T11:40:00Z", 3060)  # 51 min
+        b = _mk_activity("b", "Apple Health Workout", "running",
+                         "2026-03-03T11:41:00Z", 420)  # 7 min, inside
+        assert _are_duplicates(a, b) is True
+
+    def test_no_time_overlap_not_duplicate(self):
+        a = _mk_activity("a", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 600)  # 10:00-10:10
+        b = _mk_activity("b", "Apple Health Workout", "running",
+                         "2026-03-03T10:11:00Z", 600)  # 10:11-10:21
+        assert _are_duplicates(a, b) is False
+
+    def test_small_overlap_not_duplicate(self):
+        """Overlap below 50% of min duration -> not duplicates."""
+        a = _mk_activity("a", "Бег", "running",
+                         "2026-03-03T06:00:00Z", 3600)  # 60 min
+        b = _mk_activity("b", "Apple Health Workout", "running",
+                         "2026-03-03T06:42:00Z", 2940)  # 49 min
+        # Overlap 18 min, 18/49 = 36.7% -> NOT duplicates
+        assert _are_duplicates(a, b) is False
+
+    def test_zero_duration_not_duplicate(self):
+        a = _mk_activity("a", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 0)
+        b = _mk_activity("b", "WHOOP • running", "running",
+                         "2026-03-03T10:00:00Z", 600)
+        assert _are_duplicates(a, b) is False
+
+
+class TestPickCanonical:
+    def test_whoop_wins_over_apple(self):
+        whoop = _mk_activity("w", "WHOOP • running", "running",
+                             "2026-03-03T10:00:00Z", 300, calories=100)
+        apple = _mk_activity("a", "Apple Health Workout", "running",
+                             "2026-03-03T10:00:00Z", 300, calories=100)
+        assert _pick_canonical([whoop, apple]).id == "w"
+
+    def test_apple_wins_over_manual(self):
+        apple = _mk_activity("a", "Apple Health Workout", "running",
+                             "2026-03-03T10:00:00Z", 300)
+        manual = _mk_activity("m", "Бег", "running",
+                              "2026-03-03T10:00:00Z", 600)  # longer
+        # Apple > manual despite shorter duration (source priority)
+        assert _pick_canonical([apple, manual]).id == "a"
+
+    def test_longer_duration_tiebreaker_within_source(self):
+        short = _mk_activity("s", "Бег", "running",
+                             "2026-03-03T10:00:00Z", 300)
+        long = _mk_activity("l", "Бег", "running",
+                            "2026-03-03T10:00:00Z", 900)
+        assert _pick_canonical([short, long]).id == "l"
+
+
+class TestDeduplicate:
+    def test_empty_list(self):
+        result, removed = _deduplicate([])
+        assert result == []
+        assert removed == 0
+
+    def test_no_duplicates(self):
+        acts = [
+            _mk_activity("1", "Бег", "running",
+                         "2026-03-03T08:00:00Z", 600),
+            _mk_activity("2", "WHOOP • cycling", "cycling",
+                         "2026-03-03T10:00:00Z", 1800),
+            _mk_activity("3", "Бег", "running",
+                         "2026-03-04T08:00:00Z", 600),
+        ]
+        result, removed = _deduplicate(acts)
+        assert len(result) == 3
+        assert removed == 0
+
+    def test_three_overlapping_collapse_to_one(self):
+        """Three records for the same workout should collapse to one."""
+        acts = [
+            _mk_activity("manual", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 1800, calories=400),
+            _mk_activity("apple", "Apple Health Workout", "running",
+                         "2026-03-03T10:05:00Z", 1200, calories=300),
+            _mk_activity("whoop", "WHOOP • running", "running",
+                         "2026-03-03T10:10:00Z", 900, calories=200),
+        ]
+        result, removed = _deduplicate(acts)
+        assert len(result) == 1
+        assert removed == 2
+        # WHOOP wins by source priority
+        assert result[0].id == "whoop"
+
+    def test_different_days_not_merged(self):
+        acts = [
+            _mk_activity("a", "Бег", "running",
+                         "2026-03-03T10:00:00Z", 600),
+            _mk_activity("b", "Apple Health Workout", "running",
+                         "2026-03-04T10:00:00Z", 600),
+        ]
+        result, removed = _deduplicate(acts)
+        assert len(result) == 2
+        assert removed == 0
+
+
+class TestDeduplicationOnRealData:
+    def setup_method(self):
+        self.svc = SportsService()
+
+    def test_unique_fewer_than_clean(self):
+        """Deduplication should reduce activity count on real data."""
+        assert len(self.svc.unique_activities) < len(self.svc.clean_activities)
+        assert self.svc.duplicates_removed > 0
+
+    def test_unique_excludes_test_data(self):
+        for a in self.svc.unique_activities:
+            assert ActivityFlag.TEST_DATA not in a.flags
+
+    def test_unique_sorted_by_start_time(self):
+        starts = [a.startTime for a in self.svc.unique_activities]
+        assert starts == sorted(starts)
+
+    def test_march_3_deduplicated(self):
+        """On March 3rd, the Apple Health 11:41-11:48 record (inside manual
+        11:40-12:31) should collapse the pair into a single record."""
+        mar3 = [
+            a for a in self.svc.unique_activities
+            if a.startTime.date() == date(2026, 3, 3)
+        ]
+        # Count should be less than clean count for that day
+        clean_mar3 = [
+            a for a in self.svc.clean_activities
+            if a.startTime.date() == date(2026, 3, 3)
+        ]
+        assert len(mar3) < len(clean_mar3)
+
+    def test_march_3_no_debug_records(self):
+        mar3 = [
+            a for a in self.svc.unique_activities
+            if a.startTime.date() == date(2026, 3, 3)
+        ]
+        for a in mar3:
+            assert "debug" not in a.title.lower()
+            assert "fake" not in a.title.lower()
+
+    def test_load_report_includes_dedup_stats(self):
+        report = self.svc.load_report
+        assert report.activities_unique > 0
+        assert report.activities_unique <= report.activities_loaded
+        assert report.activities_duplicates_removed == self.svc.duplicates_removed
+
+    def test_training_volume_not_inflated(self):
+        """Total duration of unique activities <= clean activities."""
+        clean_total = sum(a.duration for a in self.svc.clean_activities)
+        unique_total = sum(a.duration for a in self.svc.unique_activities)
+        assert unique_total <= clean_total
+
+
+# ---------------------------------------------------------------
+# Calories analytics (Stage 3)
+# ---------------------------------------------------------------
+
+class TestCaloriesAnalytics:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_calories_section_present(self):
+        result = self.svc._build_calories_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "КАЛОРИИ" in result
+        assert "Всего" in result
+
+    def test_calories_uses_fallback_for_null_days(self):
+        """Days with null caloriesKcal should fall back to activity sums."""
+        # Mar 10-14 have caloriesKcal=null in daily-facts (except Mar 14 null too)
+        result = self.svc._build_calories_analytics(
+            date(2026, 3, 10), date(2026, 3, 16),
+        )
+        # Either shows facts or activities source
+        assert "kcal" in result
+
+    def test_calories_empty_period(self):
+        result = self.svc._build_calories_analytics(
+            date(2026, 6, 1), date(2026, 6, 7),
+        )
+        assert "Нет данных" in result
+
+    def test_calories_per_day_listing(self):
+        result = self.svc._build_calories_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "По дням:" in result
+
+    def test_calories_no_double_counting(self):
+        """Total calories shown <= sum of clean activities (dedup works)."""
+        d_from, d_to = date(2026, 3, 1), date(2026, 3, 16)
+        clean_sum = sum(
+            a.calories for a in self.svc.clean_activities
+            if d_from <= a.startTime.date() <= d_to
+        )
+        unique_sum = sum(
+            a.calories for a in self.svc.unique_activities
+            if d_from <= a.startTime.date() <= d_to
+        )
+        assert unique_sum <= clean_sum
+
+
+# ---------------------------------------------------------------
+# Rest days analytics (Stage 3)
+# ---------------------------------------------------------------
+
+class TestRestDaysAnalytics:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_rest_days_section_present(self):
+        result = self.svc._build_rest_days_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "ДНИ ОТДЫХА" in result
+        assert "Тренировочных дней" in result
+        assert "дней отдыха" in result
+
+    def test_rest_days_excludes_training_days(self):
+        """Days with training should not appear in rest-days list."""
+        d_from, d_to = date(2026, 3, 1), date(2026, 3, 16)
+        result = self.svc._build_rest_days_analytics(d_from, d_to)
+        active_days = {
+            a.startTime.date().isoformat()
+            for a in self.svc.unique_activities
+            if d_from <= a.startTime.date() <= d_to
+        }
+        # Split into "Дни отдыха:" section
+        if "Дни отдыха:" in result:
+            rest_section = result.split("Дни отдыха:")[1]
+            for d in active_days:
+                # Active day lines should not be inside the rest-day list
+                assert d not in rest_section
+
+    def test_rest_days_invalid_range(self):
+        result = self.svc._build_rest_days_analytics(
+            date(2026, 3, 10), date(2026, 3, 1),
+        )
+        assert "Некорректный период" in result
+
+
+# ---------------------------------------------------------------
+# Weekly training load (Stage 3)
+# ---------------------------------------------------------------
+
+class TestWeeklyLoadAnalytics:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_weekly_load_section_present(self):
+        result = self.svc._build_weekly_load_analytics(
+            date(2026, 2, 25), date(2026, 3, 16),
+        )
+        assert "НЕДЕЛЬНАЯ НАГРУЗКА" in result
+        assert "По неделям" in result
+
+    def test_weekly_load_groups_by_monday(self):
+        """Each week entry should start on a Monday."""
+        result = self.svc._build_weekly_load_analytics(
+            date(2026, 2, 25), date(2026, 3, 16),
+        )
+        # Look for some known Mondays in the output
+        # Feb 2026: Feb 23 is Monday. Mar 2 is Monday. Mar 9 is Monday.
+        assert ("2026-03-02" in result) or ("2026-03-09" in result)
+
+    def test_weekly_load_total_count_matches_dedup(self):
+        d_from, d_to = date(2026, 2, 25), date(2026, 3, 16)
+        expected = sum(
+            1 for a in self.svc.unique_activities
+            if d_from <= a.startTime.date() <= d_to
+        )
+        result = self.svc._build_weekly_load_analytics(d_from, d_to)
+        assert f"Всего тренировок (после дедупликации): {expected}" in result
+
+    def test_weekly_load_empty_period(self):
+        result = self.svc._build_weekly_load_analytics(
+            date(2026, 6, 1), date(2026, 6, 7),
+        )
+        assert "Нет тренировок" in result
+
+
+# ---------------------------------------------------------------
+# Running progress (Stage 3)
+# ---------------------------------------------------------------
+
+class TestRunningProgressAnalytics:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_progress_section_present(self):
+        result = self.svc._build_running_progress_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "ПРОГРЕСС В БЕГЕ" in result
+        # Either has pace info or says no data
+        assert ("мин/км" in result) or ("Нет пробежек" in result)
+
+    def test_progress_skips_zero_distance(self):
+        """Runs with distance=0 (some 'Бег' records) should be skipped."""
+        result = self.svc._build_running_progress_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        # Ensure we don't crash on zero-distance runs
+        assert result  # non-empty
+
+    def test_progress_empty_period(self):
+        result = self.svc._build_running_progress_analytics(
+            date(2026, 6, 1), date(2026, 6, 7),
+        )
+        assert "Нет пробежек" in result
+
+
+# ---------------------------------------------------------------
+# Stage 3 intent detection
+# ---------------------------------------------------------------
+
+class TestStage3IntentDetection:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_detect_calories_калории(self):
+        assert self.svc._detect_calories_intent("сколько калорий я сжёг") is True
+
+    def test_detect_calories_ккал(self):
+        assert self.svc._detect_calories_intent("покажи ккал за март") is True
+
+    def test_detect_calories_negative(self):
+        assert self.svc._detect_calories_intent("покажи тренировки") is False
+
+    def test_detect_rest_days_отдых(self):
+        assert self.svc._detect_rest_days_intent("сколько дней отдыха") is True
+
+    def test_detect_rest_days_без_тренировок(self):
+        assert self.svc._detect_rest_days_intent("дни без тренировок") is True
+
+    def test_detect_weekly_load_нагрузка(self):
+        assert self.svc._detect_weekly_load_intent("моя нагрузка за месяц") is True
+
+    def test_detect_weekly_load_недельная(self):
+        assert self.svc._detect_weekly_load_intent("недельный объём тренировок") is True
+
+    def test_detect_progress_прогресс(self):
+        assert self.svc._detect_progress_intent("мой прогресс в беге") is True
+
+    def test_detect_progress_темп(self):
+        assert self.svc._detect_progress_intent("как меняется темп") is True
+
+    def test_detect_progress_negative(self):
+        assert self.svc._detect_progress_intent("покажи шаги") is False
+
+
+# ---------------------------------------------------------------
+# Stage 3 get_analytics() integration
+# ---------------------------------------------------------------
+
+class TestStage3GetAnalytics:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_calories_query(self):
+        result = self.svc.get_analytics("сколько калорий я сжёг за март")
+        assert "КАЛОРИИ" in result
+
+    def test_rest_days_query(self):
+        result = self.svc.get_analytics("сколько дней отдыха в марте")
+        assert "ДНИ ОТДЫХА" in result
+
+    def test_weekly_load_query(self):
+        result = self.svc.get_analytics("моя недельная нагрузка за март")
+        assert "НЕДЕЛЬНАЯ НАГРУЗКА" in result
+
+    def test_running_progress_query(self):
+        result = self.svc.get_analytics("мой прогресс в беге за март")
+        assert "ПРОГРЕСС В БЕГЕ" in result
+
+    def test_progress_with_cycling_filter_skips_running(self):
+        """Progress query for cycling should not produce running-progress section."""
+        result = self.svc.get_analytics("прогресс в велосипеде за март")
+        assert "ПРОГРЕСС В БЕГЕ" not in result
+
+    def test_summary_mentions_dedup_when_duplicates_present(self):
+        summary = self.svc.get_summary()
+        assert "дедупликации" in summary
+
