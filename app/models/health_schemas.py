@@ -62,13 +62,29 @@ class Activity(BaseModel):
 
 
 class DailyFact(BaseModel):
-    """Daily aggregated health metrics."""
+    """Daily aggregated health metrics.
+
+    Core metrics are always present in the schema (may be None if not
+    recorded for a particular day). Extended metrics (HRV, resting HR, SpO2,
+    skin temperature, sleep duration) are optional — they may be referenced
+    in `sourcesJson` without corresponding field values in the payload.
+    The schema accepts them when present, and the service detects actual
+    availability at load time.
+    """
     id: str
     isoDate: date
     steps: int = 0
     caloriesKcal: float | None = None
     recoveryScore: float | None = None
     sleepPerformancePercentage: float | None = None
+
+    # Extended metrics (optional — may or may not be present in data)
+    hrvRmssdMilli: float | None = None
+    restingHeartRate: float | None = None
+    spo2Percentage: float | None = None
+    skinTempCelsius: float | None = None
+    sleepTotalInBedTimeMilli: int | None = None
+
     sourcesJson: str = "{}"
 
     # Parsed version of sourcesJson
@@ -128,4 +144,5 @@ class DataLoadReport(BaseModel):
     date_range_start: date | None = None
     date_range_end: date | None = None
     available_metrics: list[str] = []
+    unavailable_metrics: list[str] = []
     sport_types: list[str] = []
