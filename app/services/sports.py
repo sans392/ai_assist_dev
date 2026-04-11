@@ -4,6 +4,8 @@ Loads data from three JSON files (activities, daily-facts, health-days),
 validates via Pydantic models, flags anomalies, and provides query methods.
 
 Stage 2 Level A: intent detection + pre-computed analytics for reliable metrics.
+Stage 3 Level B: deduplication across sources + cross-file analytics
+(calories fallback, rest days, weekly load, running progress by pace).
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -55,6 +57,114 @@ _SPORT_KEYWORDS: dict[str, list[str]] = {
     "cycling": ["велосипед", "cycling", "велотренировк", "велик"],
 }
 
+# Source priority for selecting canonical record among duplicates.
+# Higher number = higher priority.
+_SOURCE_PRIORITY: dict[str, int] = {
+    "whoop": 3,
+    "apple_health": 2,
+    "manual": 1,
+}
+
+# Threshold for treating two activities as duplicates:
+# overlap duration / min(duration_a, duration_b) > this value.
+_DUPLICATE_OVERLAP_RATIO = 0.5
+
+
+def _activity_source(a: Activity) -> str:
+    """Infer the recording source of an activity from its title."""
+    title = (a.title or "").lower()
+    if "whoop" in title:
+        return "whoop"
+    if "apple" in title:
+        return "apple_health"
+    return "manual"
+
+
+def _overlap_seconds(a: Activity, b: Activity) -> float:
+    """Return the number of seconds that two activities overlap in time."""
+    start = max(a.startTime, b.startTime)
+    end = min(a.endTime, b.endTime)
+    delta = (end - start).total_seconds()
+    return max(0.0, delta)
+
+
+def _are_duplicates(a: Activity, b: Activity) -> bool:
+    """Two activities are duplicates if they are the same day, same sport,
+    and overlap for more than DUPLICATE_OVERLAP_RATIO of the shorter one."""
+    if a.sportType != b.sportType:
+        return False
+    if a.startTime.date() != b.startTime.date():
+        return False
+    overlap = _overlap_seconds(a, b)
+    if overlap <= 0:
+        return False
+    min_dur = min(a.duration, b.duration)
+    if min_dur <= 0:
+        return False
+    return (overlap / min_dur) > _DUPLICATE_OVERLAP_RATIO
+
+
+def _pick_canonical(group: list[Activity]) -> Activity:
+    """Pick the canonical record from a group of overlapping activities.
+
+    Priority: source priority (WHOOP > Apple Health > manual),
+    tiebroken by longer duration, then by earliest start time.
+    """
+    return max(
+        group,
+        key=lambda a: (
+            _SOURCE_PRIORITY.get(_activity_source(a), 0),
+            a.duration,
+            -a.startTime.timestamp(),
+        ),
+    )
+
+
+def _deduplicate(activities: list[Activity]) -> tuple[list[Activity], int]:
+    """Deduplicate a list of activities by time-overlap + source priority.
+
+    Returns (deduped_activities, removed_count).
+    The input is assumed to already be filtered of test/debug records.
+    """
+    if not activities:
+        return [], 0
+
+    # Group by (day, sportType) to limit pairwise comparisons
+    by_bucket: dict[tuple[date, str], list[int]] = defaultdict(list)
+    for idx, a in enumerate(activities):
+        by_bucket[(a.startTime.date(), a.sportType)].append(idx)
+
+    # Union-find across the full list
+    parent = list(range(len(activities)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for indices in by_bucket.values():
+        n = len(indices)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if _are_duplicates(activities[indices[i]], activities[indices[j]]):
+                    union(indices[i], indices[j])
+
+    # Build groups, pick canonical per group
+    groups: dict[int, list[Activity]] = defaultdict(list)
+    for idx, a in enumerate(activities):
+        groups[find(idx)].append(a)
+
+    deduped = [_pick_canonical(g) for g in groups.values()]
+    deduped.sort(key=lambda a: a.startTime)
+    removed = len(activities) - len(deduped)
+    return deduped, removed
+
 
 def _fmt_duration(seconds: int) -> str:
     if seconds >= 3600:
@@ -81,6 +191,8 @@ class SportsService:
         self._activities: list[Activity] = []
         self._daily_facts: list[DailyFact] = []
         self._health_days: list[HealthDay] = []
+        self._unique_activities: list[Activity] = []
+        self._activities_duplicates_removed: int = 0
         self._load_report = DataLoadReport()
         self._today: date = date.today()
         self._load()
@@ -93,13 +205,23 @@ class SportsService:
         self._activities = self._load_activities()
         self._daily_facts = self._load_daily_facts()
         self._health_days = self._load_health_days()
+
+        # Stage 3: deduplicate clean activities across sources
+        clean = [
+            a for a in self._activities
+            if ActivityFlag.TEST_DATA not in a.flags
+        ]
+        self._unique_activities, self._activities_duplicates_removed = _deduplicate(clean)
+
         self._load_report = self._build_report()
 
         logger.info(
-            "SportsService loaded: %d activities (%d flagged), "
-            "%d daily facts, %d health days",
+            "SportsService loaded: %d activities (%d flagged, %d duplicates), "
+            "%d unique, %d daily facts, %d health days",
             len(self._activities),
             sum(1 for a in self._activities if a.flags),
+            self._activities_duplicates_removed,
+            len(self._unique_activities),
             len(self._daily_facts),
             len(self._health_days),
         )
@@ -209,6 +331,8 @@ class SportsService:
             activities_loaded=len(self._activities),
             activities_skipped=getattr(self, "_activities_skipped", 0),
             activities_flagged=activities_flagged,
+            activities_unique=len(self._unique_activities),
+            activities_duplicates_removed=self._activities_duplicates_removed,
             daily_facts_loaded=len(self._daily_facts),
             daily_facts_skipped=getattr(self, "_daily_facts_skipped", 0),
             health_days_loaded=len(self._health_days),
@@ -231,6 +355,21 @@ class SportsService:
     def clean_activities(self) -> list[Activity]:
         """Activities with test/debug data excluded."""
         return [a for a in self._activities if ActivityFlag.TEST_DATA not in a.flags]
+
+    @property
+    def unique_activities(self) -> list[Activity]:
+        """Deduplicated clean activities across sources.
+
+        Duplicates (same day, same sport type, >50% time overlap) are
+        collapsed to a single canonical record (source priority: WHOOP >
+        Apple Health > manual). Test/debug records are excluded.
+        """
+        return self._unique_activities
+
+    @property
+    def duplicates_removed(self) -> int:
+        """Number of activity records removed by deduplication."""
+        return self._activities_duplicates_removed
 
     @property
     def daily_facts(self) -> list[DailyFact]:
@@ -277,11 +416,11 @@ class SportsService:
             lines.append("Шаги за последние 7 дней: нет данных")
 
         # --- Training count by sport type (last 7 / 30 days) ---
-        clean = self.clean_activities
+        unique = self._unique_activities
         d30 = self._today - timedelta(days=30)
 
-        act_7d = [a for a in clean if d7 <= a.startTime.date() <= self._today]
-        act_30d = [a for a in clean if d30 <= a.startTime.date() <= self._today]
+        act_7d = [a for a in unique if d7 <= a.startTime.date() <= self._today]
+        act_30d = [a for a in unique if d30 <= a.startTime.date() <= self._today]
 
         lines.append("")
         if act_7d:
@@ -297,6 +436,13 @@ class SportsService:
             lines.append(f"Тренировки за 30 дней: {len(act_30d)} ({', '.join(parts)})")
         else:
             lines.append("Тренировки за 30 дней: нет данных")
+
+        # --- Dedup note ---
+        if self._activities_duplicates_removed > 0:
+            lines.append(
+                f"(Учтено после дедупликации: убрано "
+                f"{self._activities_duplicates_removed} дубликатов из разных источников)"
+            )
 
         # --- Recovery score + trend ---
         recovery_pairs = sorted(
@@ -342,6 +488,10 @@ class SportsService:
         wants_steps = self._detect_steps_intent(text)
         wants_training = self._detect_training_intent(text)
         wants_recovery = self._detect_recovery_intent(text)
+        wants_calories = self._detect_calories_intent(text)
+        wants_rest_days = self._detect_rest_days_intent(text)
+        wants_weekly = self._detect_weekly_load_intent(text)
+        wants_progress = self._detect_progress_intent(text)
 
         d_from, d_to = date_range if date_range else self._default_date_range()
 
@@ -349,13 +499,30 @@ class SportsService:
         if wants_steps:
             sections.append(self._build_steps_analytics(d_from, d_to))
 
+        if wants_calories:
+            sections.append(self._build_calories_analytics(d_from, d_to))
+
+        if wants_rest_days:
+            sections.append(self._build_rest_days_analytics(d_from, d_to))
+
+        if wants_weekly:
+            sections.append(self._build_weekly_load_analytics(d_from, d_to))
+
+        if wants_progress and (sport_types is None or "running" in sport_types):
+            sections.append(self._build_running_progress_analytics(d_from, d_to))
+
         if wants_training:
             sections.append(self._build_training_list(d_from, d_to, sport_types))
 
         if wants_recovery:
             sections.append(self._build_recovery_analytics(d_from, d_to))
 
-        if sport_types and not wants_training:
+        if (
+            sport_types
+            and not wants_training
+            and not wants_progress
+            and not wants_weekly
+        ):
             sections.append(self._build_sport_breakdown(sport_types, d_from, d_to))
 
         # Fallback
@@ -396,7 +563,7 @@ class SportsService:
     ) -> str:
         activities = sorted(
             [
-                a for a in self.clean_activities
+                a for a in self._unique_activities
                 if d_from <= a.startTime.date() <= d_to
                 and (not sport_types or a.sportType in sport_types)
             ],
@@ -463,7 +630,7 @@ class SportsService:
         self, sport_types: set[str], d_from: date, d_to: date,
     ) -> str:
         activities = sorted(
-            [a for a in self.clean_activities
+            [a for a in self._unique_activities
              if d_from <= a.startTime.date() <= d_to and a.sportType in sport_types],
             key=lambda a: a.startTime,
         )
@@ -518,12 +685,272 @@ class SportsService:
                 f"{_fmt_steps(avg)} в среднем/день"
             )
 
-        clean = self.clean_activities
-        recent_acts = [a for a in clean if d_from <= a.startTime.date() <= d_to]
+        unique = self._unique_activities
+        recent_acts = [a for a in unique if d_from <= a.startTime.date() <= d_to]
         if recent_acts:
             by_sport = Counter(a.sportType for a in recent_acts)
             parts = [f"{s}: {c}" for s, c in sorted(by_sport.items())]
             lines.append(f"Тренировки: {len(recent_acts)} ({', '.join(parts)})")
+
+        return "\n".join(lines)
+
+    # ==================================================================
+    # STAGE 3: CROSS-FILE ANALYTICS
+    # ==================================================================
+
+    def _build_calories_analytics(self, d_from: date, d_to: date) -> str:
+        """Total calories burned in a period.
+
+        Primary source: daily-facts.caloriesKcal (summed where present).
+        Fallback for missing days: sum of deduplicated activities on that day.
+        """
+        lines = [f"--- КАЛОРИИ ({d_from} — {d_to}) ---"]
+
+        facts_in_range = sorted(
+            [f for f in self._daily_facts if d_from <= f.isoDate <= d_to],
+            key=lambda f: f.isoDate,
+        )
+        if not facts_in_range and not any(
+            d_from <= a.startTime.date() <= d_to for a in self._unique_activities
+        ):
+            lines.append("Нет данных о калориях за указанный период.")
+            return "\n".join(lines)
+
+        # Build per-day activity-calorie index from deduped activities
+        act_by_day: dict[date, float] = defaultdict(float)
+        for a in self._unique_activities:
+            d = a.startTime.date()
+            if d_from <= d <= d_to:
+                act_by_day[d] += a.calories
+
+        total_from_facts = 0.0
+        total_from_activities = 0.0
+        days_from_facts = 0
+        days_from_activities = 0
+        missing_days = 0
+
+        per_day: list[tuple[date, float, str]] = []
+        for f in facts_in_range:
+            if f.caloriesKcal is not None:
+                per_day.append((f.isoDate, f.caloriesKcal, "daily-facts"))
+                total_from_facts += f.caloriesKcal
+                days_from_facts += 1
+            elif f.isoDate in act_by_day:
+                val = act_by_day[f.isoDate]
+                per_day.append((f.isoDate, val, "activities"))
+                total_from_activities += val
+                days_from_activities += 1
+            else:
+                per_day.append((f.isoDate, 0.0, "—"))
+                missing_days += 1
+
+        total = total_from_facts + total_from_activities
+        total_days = days_from_facts + days_from_activities
+
+        lines.append(f"Всего: {total:.0f} kcal за {total_days} дн.")
+        if days_from_facts:
+            lines.append(
+                f"  из daily-facts: {total_from_facts:.0f} kcal "
+                f"({days_from_facts} дн.)"
+            )
+        if days_from_activities:
+            lines.append(
+                f"  из активностей (fallback): {total_from_activities:.0f} kcal "
+                f"({days_from_activities} дн.)"
+            )
+        if missing_days:
+            lines.append(f"  нет данных: {missing_days} дн.")
+        if total_days > 0:
+            avg = total / total_days
+            lines.append(f"В среднем: {avg:.0f} kcal/день")
+
+        lines.append("")
+        lines.append("По дням:")
+        for d, val, src in per_day:
+            if src == "—":
+                lines.append(f"  {d}: — (нет данных)")
+            else:
+                lines.append(f"  {d}: {val:.0f} kcal [{src}]")
+
+        return "\n".join(lines)
+
+    def _build_rest_days_analytics(self, d_from: date, d_to: date) -> str:
+        """Days in range with no training activity (after dedup)."""
+        lines = [f"--- ДНИ ОТДЫХА ({d_from} — {d_to}) ---"]
+
+        total_days = (d_to - d_from).days + 1
+        if total_days <= 0:
+            lines.append("Некорректный период.")
+            return "\n".join(lines)
+
+        active_days: set[date] = {
+            a.startTime.date() for a in self._unique_activities
+            if d_from <= a.startTime.date() <= d_to
+        }
+
+        # Only consider days that are covered by daily-facts (otherwise we
+        # can't tell if there really was no training or just no data).
+        covered_days: set[date] = {
+            f.isoDate for f in self._daily_facts
+            if d_from <= f.isoDate <= d_to
+        }
+        # If daily-facts don't cover the whole range, fall back to all days
+        if not covered_days:
+            covered_days = {
+                d_from + timedelta(days=i) for i in range(total_days)
+            }
+
+        rest_days = sorted(covered_days - active_days)
+        training_days = sorted(covered_days & active_days)
+
+        lines.append(f"Период: {total_days} дн., данных по {len(covered_days)} дн.")
+        lines.append(
+            f"Тренировочных дней: {len(training_days)}, "
+            f"дней отдыха: {len(rest_days)}"
+        )
+
+        if rest_days:
+            lines.append("")
+            lines.append("Дни отдыха:")
+            for d in rest_days:
+                lines.append(f"  {d}")
+
+        return "\n".join(lines)
+
+    def _build_weekly_load_analytics(self, d_from: date, d_to: date) -> str:
+        """Weekly training load: count, total duration, total calories per week."""
+        lines = [f"--- НЕДЕЛЬНАЯ НАГРУЗКА ({d_from} — {d_to}) ---"]
+
+        acts = [
+            a for a in self._unique_activities
+            if d_from <= a.startTime.date() <= d_to
+        ]
+        if not acts:
+            lines.append("Нет тренировок за указанный период.")
+            return "\n".join(lines)
+
+        # Group by ISO week (Monday of the week)
+        by_week: dict[date, list[Activity]] = defaultdict(list)
+        for a in acts:
+            d = a.startTime.date()
+            monday = d - timedelta(days=d.weekday())
+            by_week[monday].append(a)
+
+        lines.append(f"Всего тренировок (после дедупликации): {len(acts)}")
+        lines.append("")
+        lines.append("По неделям (начало недели — понедельник):")
+        for monday in sorted(by_week.keys()):
+            week_acts = by_week[monday]
+            sunday = monday + timedelta(days=6)
+            total_dur = sum(a.duration for a in week_acts)
+            total_cal = sum(a.calories for a in week_acts)
+            total_dist = sum(a.distance for a in week_acts)
+            by_sport = Counter(a.sportType for a in week_acts)
+            sport_str = ", ".join(
+                f"{s}: {c}" for s, c in sorted(by_sport.items())
+            )
+            lines.append(
+                f"  {monday} — {sunday}: {len(week_acts)} трен. "
+                f"({sport_str}), {_fmt_duration(total_dur)}, "
+                f"{_fmt_distance(total_dist)}, {total_cal:.0f} kcal"
+            )
+
+        return "\n".join(lines)
+
+    def _build_running_progress_analytics(
+        self, d_from: date, d_to: date,
+    ) -> str:
+        """Running progress: compare average pace across periods.
+
+        Pace is computed as seconds per kilometre, averaged over activities
+        with non-zero distance. Also splits the range in two halves to show
+        short-term trend.
+        """
+        lines = [f"--- ПРОГРЕСС В БЕГЕ ({d_from} — {d_to}) ---"]
+
+        runs = [
+            a for a in self._unique_activities
+            if a.sportType == "running"
+            and d_from <= a.startTime.date() <= d_to
+            and a.distance > 0
+            and a.duration > 0
+        ]
+
+        skipped_no_dist = sum(
+            1 for a in self._unique_activities
+            if a.sportType == "running"
+            and d_from <= a.startTime.date() <= d_to
+            and (a.distance <= 0 or a.duration <= 0)
+        )
+
+        if not runs:
+            lines.append("Нет пробежек с дистанцией за указанный период.")
+            if skipped_no_dist:
+                lines.append(
+                    f"(Пропущено {skipped_no_dist} без дистанции/длительности)"
+                )
+            return "\n".join(lines)
+
+        runs.sort(key=lambda a: a.startTime)
+
+        def pace_sec_per_km(a: Activity) -> float:
+            return a.duration / (a.distance / 1000)
+
+        def _fmt_pace(sec_per_km: float) -> str:
+            m = int(sec_per_km // 60)
+            s = int(sec_per_km % 60)
+            return f"{m}:{s:02d} мин/км"
+
+        total_distance = sum(a.distance for a in runs)
+        total_duration = sum(a.duration for a in runs)
+        overall_pace = total_duration / (total_distance / 1000)
+
+        lines.append(f"Пробежек: {len(runs)}")
+        lines.append(f"Общая дистанция: {_fmt_distance(total_distance)}")
+        lines.append(f"Общее время: {_fmt_duration(total_duration)}")
+        lines.append(f"Средний темп: {_fmt_pace(overall_pace)}")
+
+        # Compare first half vs second half (by count)
+        if len(runs) >= 2:
+            half = len(runs) // 2
+            first = runs[:half] if half > 0 else runs[:1]
+            second = runs[half:] if half > 0 else runs[1:]
+            if first and second:
+                p1 = sum(a.duration for a in first) / (
+                    sum(a.distance for a in first) / 1000
+                )
+                p2 = sum(a.duration for a in second) / (
+                    sum(a.distance for a in second) / 1000
+                )
+                lines.append("")
+                lines.append(
+                    f"Первая половина ({len(first)} пробежек): {_fmt_pace(p1)}"
+                )
+                lines.append(
+                    f"Вторая половина ({len(second)} пробежек): {_fmt_pace(p2)}"
+                )
+                diff = p2 - p1
+                if diff < -5:
+                    lines.append("Темп улучшается: ↑ быстрее")
+                elif diff > 5:
+                    lines.append("Темп замедляется: ↓ медленнее")
+                else:
+                    lines.append("Темп стабилен: →")
+
+        lines.append("")
+        lines.append("По пробежкам:")
+        for a in runs:
+            d_str = a.startTime.strftime("%Y-%m-%d")
+            lines.append(
+                f"  {d_str} | {_fmt_distance(a.distance)} | "
+                f"{_fmt_duration(a.duration)} | {_fmt_pace(pace_sec_per_km(a))}"
+            )
+
+        if skipped_no_dist:
+            lines.append("")
+            lines.append(
+                f"(Пропущено {skipped_no_dist} пробежек без дистанции)"
+            )
 
         return "\n".join(lines)
 
@@ -541,6 +968,28 @@ class SportsService:
 
     def _detect_recovery_intent(self, text: str) -> bool:
         return any(kw in text for kw in ["восстановлен", "recovery"])
+
+    def _detect_calories_intent(self, text: str) -> bool:
+        return any(kw in text for kw in ["калори", "ккал", "kcal", "calories"])
+
+    def _detect_rest_days_intent(self, text: str) -> bool:
+        keywords = ["день отдыха", "дни отдыха", "дней отдыха",
+                    "отдых", "rest day", "без трениров"]
+        return any(kw in text for kw in keywords)
+
+    def _detect_weekly_load_intent(self, text: str) -> bool:
+        keywords = [
+            "нагрузк", "объём трениров", "объем трениров",
+            "недельн", "по недел", "weekly", "training load",
+        ]
+        return any(kw in text for kw in keywords)
+
+    def _detect_progress_intent(self, text: str) -> bool:
+        keywords = [
+            "прогресс", "темп", "pace", "улучш", "progress",
+            "быстрее", "медленнее",
+        ]
+        return any(kw in text for kw in keywords)
 
     def _detect_sport_type(self, text: str) -> set[str] | None:
         found: set[str] = set()
