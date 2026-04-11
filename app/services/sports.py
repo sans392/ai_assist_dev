@@ -6,6 +6,9 @@ validates via Pydantic models, flags anomalies, and provides query methods.
 Stage 2 Level A: intent detection + pre-computed analytics for reliable metrics.
 Stage 3 Level B: deduplication across sources + cross-file analytics
 (calories fallback, rest days, weekly load, running progress by pace).
+Stage 4 Level C: metric availability detection (graceful degradation when
+HRV/sleep/SpO2/resting HR/skin temp data is missing) + correlations
+(recovery vs training load, sleep vs recovery, HRV vs training intensity).
 """
 
 from __future__ import annotations
@@ -68,6 +71,21 @@ _SOURCE_PRIORITY: dict[str, int] = {
 # Threshold for treating two activities as duplicates:
 # overlap duration / min(duration_a, duration_b) > this value.
 _DUPLICATE_OVERLAP_RATIO = 0.5
+
+# Canonical metric keys tracked for availability. Order matters for stable
+# display. Each key maps to a human-readable Russian label used in system
+# prompts and "нет данных" messages.
+_METRIC_LABELS_RU: dict[str, str] = {
+    "steps": "шаги",
+    "caloriesKcal": "калории",
+    "recoveryScore": "восстановление",
+    "sleepPerformancePercentage": "эффективность сна",
+    "hrvRmssdMilli": "HRV (вариабельность пульса)",
+    "restingHeartRate": "пульс в покое",
+    "spo2Percentage": "SpO2 (насыщение кислородом)",
+    "skinTempCelsius": "температура кожи",
+    "sleepTotalInBedTimeMilli": "длительность сна",
+}
 
 
 def _activity_source(a: Activity) -> str:
@@ -312,18 +330,8 @@ class SportsService:
         date_start = min(dates) if dates else None
         date_end = max(dates) if dates else None
 
-        available: set[str] = set()
-        for f in self._daily_facts:
-            if f.steps > 0:
-                available.add("steps")
-            if f.caloriesKcal is not None:
-                available.add("caloriesKcal")
-            if f.recoveryScore is not None:
-                available.add("recoveryScore")
-            if f.sleepPerformancePercentage is not None:
-                available.add("sleepPerformancePercentage")
-            for key in f.sources:
-                available.add(key)
+        available = self._compute_available_metrics()
+        unavailable = [m for m in _METRIC_LABELS_RU if m not in available]
 
         sport_types = sorted({a.sportType for a in self._activities})
 
@@ -339,9 +347,33 @@ class SportsService:
             health_days_skipped=getattr(self, "_health_days_skipped", 0),
             date_range_start=date_start,
             date_range_end=date_end,
-            available_metrics=sorted(available),
+            available_metrics=available,
+            unavailable_metrics=unavailable,
             sport_types=sport_types,
         )
+
+    def _compute_available_metrics(self) -> list[str]:
+        """Determine which canonical metrics have at least one real value.
+
+        Availability is judged by actual stored field values on DailyFact
+        records — NOT by keys mentioned in `sourcesJson`. A metric is
+        "available" only if at least one daily-fact has a non-null value
+        for that metric field.
+        """
+        available: list[str] = []
+        for metric in _METRIC_LABELS_RU:
+            if self._metric_has_any_value(metric):
+                available.append(metric)
+        return available
+
+    def _metric_has_any_value(self, metric: str) -> bool:
+        """Check if any daily fact has a real value for the given metric."""
+        if metric == "steps":
+            return any(f.steps > 0 for f in self._daily_facts)
+        for f in self._daily_facts:
+            if getattr(f, metric, None) is not None:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Public properties
@@ -383,6 +415,47 @@ class SportsService:
     def load_report(self) -> DataLoadReport:
         return self._load_report
 
+    # ------------------------------------------------------------------
+    # Stage 4: metric availability (graceful degradation)
+    # ------------------------------------------------------------------
+
+    def get_available_metrics(self) -> list[str]:
+        """Canonical metric names that have at least one real value in data."""
+        return list(self._load_report.available_metrics)
+
+    def get_unavailable_metrics(self) -> list[str]:
+        """Canonical metric names tracked but absent from data."""
+        return list(self._load_report.unavailable_metrics)
+
+    def is_metric_available(self, metric: str) -> bool:
+        """Whether the given canonical metric has any data."""
+        return metric in self._load_report.available_metrics
+
+    def get_availability_section(self) -> str:
+        """Human-readable availability block for the system prompt."""
+        available = self.get_available_metrics()
+        unavailable = self.get_unavailable_metrics()
+
+        available_labels = [_METRIC_LABELS_RU[m] for m in available]
+        unavailable_labels = [_METRIC_LABELS_RU[m] for m in unavailable]
+
+        lines = ["--- ДОСТУПНОСТЬ МЕТРИК ---"]
+        if available_labels:
+            lines.append(f"Доступные метрики: {', '.join(available_labels)}")
+        else:
+            lines.append("Доступные метрики: нет")
+        if unavailable_labels:
+            lines.append(
+                f"Недоступные метрики: {', '.join(unavailable_labels)}"
+            )
+            lines.append(
+                "ВАЖНО: для недоступных метрик нет данных — "
+                "никогда не выдумывай и не оценивай значения. "
+                "Если пользователь спрашивает о них — честно сообщи, "
+                "что этих данных нет в загруженных источниках."
+            )
+        return "\n".join(lines)
+
     # ==================================================================
     # PUBLIC: summary (always in system prompt)
     # ==================================================================
@@ -398,6 +471,10 @@ class SportsService:
             f"Сегодняшняя дата: {self._today.isoformat()}",
             f"Период данных: {report.date_range_start} — {report.date_range_end}",
         ]
+
+        # --- Metric availability (Stage 4) ---
+        lines.append("")
+        lines.append(self.get_availability_section())
 
         # --- Steps for last 7 days ---
         d7 = self._today - timedelta(days=7)
@@ -492,8 +569,40 @@ class SportsService:
         wants_rest_days = self._detect_rest_days_intent(text)
         wants_weekly = self._detect_weekly_load_intent(text)
         wants_progress = self._detect_progress_intent(text)
+        wants_hrv = self._detect_hrv_intent(text)
+        wants_sleep = self._detect_sleep_intent(text)
+        wants_spo2 = self._detect_spo2_intent(text)
+        wants_resting_hr = self._detect_resting_hr_intent(text)
+        wants_skin_temp = self._detect_skin_temp_intent(text)
+        wants_correlation = self._detect_correlation_intent(text)
 
         d_from, d_to = date_range if date_range else self._default_date_range()
+
+        # --- Extended metrics with graceful degradation ---
+        # These run before generic builders so an HRV query doesn't leak
+        # through to the fallback.
+        if wants_hrv:
+            sections.append(
+                self._build_extended_metric_analytics("hrvRmssdMilli", d_from, d_to)
+            )
+        if wants_sleep:
+            sections.append(self._build_sleep_analytics(d_from, d_to))
+        if wants_spo2:
+            sections.append(
+                self._build_extended_metric_analytics("spo2Percentage", d_from, d_to)
+            )
+        if wants_resting_hr:
+            sections.append(
+                self._build_extended_metric_analytics(
+                    "restingHeartRate", d_from, d_to
+                )
+            )
+        if wants_skin_temp:
+            sections.append(
+                self._build_extended_metric_analytics(
+                    "skinTempCelsius", d_from, d_to
+                )
+            )
 
         # --- Build sections ---
         if wants_steps:
@@ -516,6 +625,9 @@ class SportsService:
 
         if wants_recovery:
             sections.append(self._build_recovery_analytics(d_from, d_to))
+
+        if wants_correlation or (wants_recovery and wants_training):
+            sections.append(self._build_correlations_analytics(d_from, d_to))
 
         if (
             sport_types
@@ -955,6 +1067,246 @@ class SportsService:
         return "\n".join(lines)
 
     # ==================================================================
+    # STAGE 4: EXTENDED METRICS + CORRELATIONS (graceful degradation)
+    # ==================================================================
+
+    def _build_extended_metric_analytics(
+        self, metric: str, d_from: date, d_to: date,
+    ) -> str:
+        """Generic builder for single-value extended metrics.
+
+        Used for HRV, SpO2, resting HR, skin temperature. If the metric
+        has no data anywhere in the dataset, returns an honest
+        "нет данных" response without inventing values.
+        """
+        label = _METRIC_LABELS_RU.get(metric, metric)
+        header = f"--- {label.upper()} ({d_from} — {d_to}) ---"
+
+        if not self.is_metric_available(metric):
+            return (
+                f"{header}\n"
+                f"Данные по метрике «{label}» отсутствуют в загруженных "
+                f"источниках. Невозможно рассчитать или оценить значения."
+            )
+
+        facts = sorted(
+            [
+                f for f in self._daily_facts
+                if d_from <= f.isoDate <= d_to
+                and getattr(f, metric, None) is not None
+            ],
+            key=lambda f: f.isoDate,
+        )
+
+        lines = [header]
+        if not facts:
+            lines.append(
+                f"Нет данных по «{label}» за указанный период "
+                "(хотя метрика присутствует в других периодах)."
+            )
+            return "\n".join(lines)
+
+        values = [float(getattr(f, metric)) for f in facts]
+        avg = sum(values) / len(values)
+        lines.append(f"Записей: {len(facts)}")
+        lines.append(f"Среднее: {avg:.1f}")
+        lines.append(f"Минимум: {min(values):.1f}")
+        lines.append(f"Максимум: {max(values):.1f}")
+        if len(values) >= 2:
+            lines.append(f"Тренд: {_compute_trend(values)}")
+
+        lines.append("")
+        lines.append("По дням:")
+        for f, v in zip(facts, values):
+            lines.append(f"  {f.isoDate}: {v:.1f}")
+
+        return "\n".join(lines)
+
+    def _build_sleep_analytics(self, d_from: date, d_to: date) -> str:
+        """Sleep analytics combining performance % and total time in bed.
+
+        Reports both metrics if available, falls back gracefully when
+        either or both are missing.
+        """
+        header = f"--- СОН ({d_from} — {d_to}) ---"
+        perf_available = self.is_metric_available("sleepPerformancePercentage")
+        dur_available = self.is_metric_available("sleepTotalInBedTimeMilli")
+
+        if not perf_available and not dur_available:
+            return (
+                f"{header}\n"
+                "Данные о сне (эффективность и длительность) отсутствуют "
+                "в загруженных источниках. Невозможно рассчитать или "
+                "оценить значения."
+            )
+
+        facts = sorted(
+            [f for f in self._daily_facts if d_from <= f.isoDate <= d_to],
+            key=lambda f: f.isoDate,
+        )
+
+        lines = [header]
+
+        if perf_available:
+            perf_facts = [
+                f for f in facts if f.sleepPerformancePercentage is not None
+            ]
+            if perf_facts:
+                perfs = [f.sleepPerformancePercentage for f in perf_facts]
+                avg = sum(perfs) / len(perfs)
+                lines.append(
+                    f"Эффективность сна: среднее {avg:.0f}%, "
+                    f"мин {min(perfs):.0f}%, макс {max(perfs):.0f}% "
+                    f"({len(perf_facts)} дн.)"
+                )
+            else:
+                lines.append(
+                    "Эффективность сна: нет данных за указанный период"
+                )
+        else:
+            lines.append(
+                "Эффективность сна: данных в источниках нет"
+            )
+
+        if dur_available:
+            dur_facts = [
+                f for f in facts if f.sleepTotalInBedTimeMilli is not None
+            ]
+            if dur_facts:
+                total_ms = sum(f.sleepTotalInBedTimeMilli for f in dur_facts)
+                avg_ms = total_ms / len(dur_facts)
+                avg_hours = avg_ms / 1000 / 3600
+                lines.append(
+                    f"Длительность сна: в среднем {avg_hours:.1f} ч "
+                    f"({len(dur_facts)} дн.)"
+                )
+            else:
+                lines.append(
+                    "Длительность сна: нет данных за указанный период"
+                )
+        else:
+            lines.append(
+                "Длительность сна: данных в источниках нет"
+            )
+
+        return "\n".join(lines)
+
+    def _build_correlations_analytics(
+        self, d_from: date, d_to: date,
+    ) -> str:
+        """Correlations between recovery / sleep / HRV and training load.
+
+        Runs only those sub-sections for which data is actually present,
+        so it degrades gracefully when extended metrics are missing.
+        """
+        lines = [f"--- КОРРЕЛЯЦИИ ({d_from} — {d_to}) ---"]
+
+        # Build per-day training load from unique activities
+        load_by_day: dict[date, float] = defaultdict(float)
+        duration_by_day: dict[date, float] = defaultdict(float)
+        for a in self._unique_activities:
+            d = a.startTime.date()
+            if d_from <= d <= d_to:
+                load_by_day[d] += a.calories
+                duration_by_day[d] += a.duration
+
+        def _series(metric: str) -> tuple[list[float], list[float]]:
+            xs: list[float] = []
+            ys: list[float] = []
+            for f in self._daily_facts:
+                if not (d_from <= f.isoDate <= d_to):
+                    continue
+                v = getattr(f, metric, None)
+                if v is None:
+                    continue
+                # Align with training load on the same day (can be 0)
+                xs.append(float(v))
+                ys.append(float(load_by_day.get(f.isoDate, 0.0)))
+            return xs, ys
+
+        sub_lines: list[str] = []
+
+        # 1. Recovery vs training load (calories on same day)
+        if self.is_metric_available("recoveryScore"):
+            xs, ys = _series("recoveryScore")
+            if len(xs) >= 3:
+                r = _pearson(xs, ys)
+                sub_lines.append(
+                    f"Восстановление ↔ нагрузка (kcal): "
+                    f"r = {r:.2f}, n = {len(xs)} "
+                    f"({_interpret_correlation(r)})"
+                )
+            else:
+                sub_lines.append(
+                    "Восстановление ↔ нагрузка: недостаточно парных "
+                    "наблюдений (нужно >= 3)"
+                )
+        else:
+            sub_lines.append(
+                "Восстановление ↔ нагрузка: данных о восстановлении нет"
+            )
+
+        # 2. Sleep vs recovery (both optional)
+        if (
+            self.is_metric_available("sleepPerformancePercentage")
+            and self.is_metric_available("recoveryScore")
+        ):
+            xs: list[float] = []
+            ys: list[float] = []
+            for f in self._daily_facts:
+                if not (d_from <= f.isoDate <= d_to):
+                    continue
+                if (
+                    f.sleepPerformancePercentage is not None
+                    and f.recoveryScore is not None
+                ):
+                    xs.append(f.sleepPerformancePercentage)
+                    ys.append(f.recoveryScore)
+            if len(xs) >= 3:
+                r = _pearson(xs, ys)
+                sub_lines.append(
+                    f"Сон ↔ восстановление: r = {r:.2f}, n = {len(xs)} "
+                    f"({_interpret_correlation(r)})"
+                )
+            else:
+                sub_lines.append(
+                    "Сон ↔ восстановление: недостаточно парных наблюдений"
+                )
+        else:
+            sub_lines.append(
+                "Сон ↔ восстановление: одной из метрик нет в источниках"
+            )
+
+        # 3. HRV vs training intensity (duration)
+        if self.is_metric_available("hrvRmssdMilli"):
+            xs: list[float] = []
+            ys: list[float] = []
+            for f in self._daily_facts:
+                if not (d_from <= f.isoDate <= d_to):
+                    continue
+                if f.hrvRmssdMilli is not None:
+                    xs.append(float(f.hrvRmssdMilli))
+                    ys.append(float(duration_by_day.get(f.isoDate, 0.0)))
+            if len(xs) >= 3:
+                r = _pearson(xs, ys)
+                sub_lines.append(
+                    f"HRV ↔ длительность тренировок: r = {r:.2f}, "
+                    f"n = {len(xs)} ({_interpret_correlation(r)})"
+                )
+            else:
+                sub_lines.append(
+                    "HRV ↔ длительность тренировок: недостаточно "
+                    "парных наблюдений"
+                )
+        else:
+            sub_lines.append(
+                "HRV ↔ длительность тренировок: данных HRV нет в источниках"
+            )
+
+        lines.extend(sub_lines)
+        return "\n".join(lines)
+
+    # ==================================================================
     # INTENT DETECTORS
     # ==================================================================
 
@@ -988,6 +1340,40 @@ class SportsService:
         keywords = [
             "прогресс", "темп", "pace", "улучш", "progress",
             "быстрее", "медленнее",
+        ]
+        return any(kw in text for kw in keywords)
+
+    def _detect_hrv_intent(self, text: str) -> bool:
+        keywords = ["hrv", "вариабельност", "rmssd"]
+        return any(kw in text for kw in keywords)
+
+    def _detect_sleep_intent(self, text: str) -> bool:
+        # "спал", "сон", "сна", "sleep"
+        keywords = ["сон", "сна", "спал", "сну", "сном", "sleep"]
+        return any(kw in text for kw in keywords)
+
+    def _detect_spo2_intent(self, text: str) -> bool:
+        keywords = ["spo2", "сатурац", "кислород", "насыщени"]
+        return any(kw in text for kw in keywords)
+
+    def _detect_resting_hr_intent(self, text: str) -> bool:
+        keywords = [
+            "пульс в покое", "пульса в покое", "rhr",
+            "resting heart", "resting hr", "покойный пульс",
+        ]
+        return any(kw in text for kw in keywords)
+
+    def _detect_skin_temp_intent(self, text: str) -> bool:
+        keywords = [
+            "температура кожи", "температуру кожи", "температуры кожи",
+            "skin temp", "skin temperature",
+        ]
+        return any(kw in text for kw in keywords)
+
+    def _detect_correlation_intent(self, text: str) -> bool:
+        keywords = [
+            "корреляц", "связь", "влиян", "зависимост",
+            "correlation", "correlate",
         ]
         return any(kw in text for kw in keywords)
 
@@ -1065,6 +1451,42 @@ def _compute_trend(values: list[float]) -> str:
     if diff < -5:
         return "↓ падает"
     return "→ стабильно"
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    """Pearson correlation coefficient for two equal-length series.
+
+    Returns 0.0 if inputs are degenerate (length < 2 or zero variance).
+    """
+    n = len(xs)
+    if n != len(ys) or n < 2:
+        return 0.0
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    denom = (var_x * var_y) ** 0.5
+    if denom == 0:
+        return 0.0
+    return num / denom
+
+
+def _interpret_correlation(r: float) -> str:
+    """Human-readable verdict for a Pearson r value."""
+    if r >= 0.7:
+        return "сильная положительная"
+    if r >= 0.4:
+        return "умеренная положительная"
+    if r >= 0.15:
+        return "слабая положительная"
+    if r <= -0.7:
+        return "сильная отрицательная"
+    if r <= -0.4:
+        return "умеренная отрицательная"
+    if r <= -0.15:
+        return "слабая отрицательная"
+    return "связи не обнаружено"
 
 
 # Module-level singleton

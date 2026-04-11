@@ -1133,3 +1133,552 @@ class TestStage3GetAnalytics:
         summary = self.svc.get_summary()
         assert "дедупликации" in summary
 
+
+# ===============================================================
+# STAGE 4: Level C analytics
+# (extended metrics, graceful degradation, correlations)
+# ===============================================================
+
+
+def _mk_daily_fact(
+    iso_date: str,
+    *,
+    steps: int = 0,
+    calories: float | None = None,
+    recovery: float | None = None,
+    sleep_perf: float | None = None,
+    hrv: float | None = None,
+    resting_hr: float | None = None,
+    spo2: float | None = None,
+    skin_temp: float | None = None,
+    sleep_ms: int | None = None,
+) -> DailyFact:
+    return DailyFact.model_validate(
+        {
+            "id": f"df-{iso_date}",
+            "isoDate": iso_date,
+            "steps": steps,
+            "caloriesKcal": calories,
+            "recoveryScore": recovery,
+            "sleepPerformancePercentage": sleep_perf,
+            "hrvRmssdMilli": hrv,
+            "restingHeartRate": resting_hr,
+            "spo2Percentage": spo2,
+            "skinTempCelsius": skin_temp,
+            "sleepTotalInBedTimeMilli": sleep_ms,
+        }
+    )
+
+
+def _make_svc_with_facts(
+    facts: list[DailyFact], today: date | None = None,
+) -> SportsService:
+    """Build a service, then replace its daily facts with synthetic data."""
+    svc = SportsService()
+    svc._daily_facts = facts
+    svc._load_report = svc._build_report()
+    if today:
+        svc._today = today
+    return svc
+
+
+# ---------------------------------------------------------------
+# Extended fields accepted by the DailyFact schema
+# ---------------------------------------------------------------
+
+
+class TestDailyFactExtendedFields:
+    def test_extended_fields_accepted(self):
+        f = _mk_daily_fact(
+            "2026-03-16",
+            steps=8000,
+            calories=500,
+            recovery=60,
+            sleep_perf=85,
+            hrv=42.5,
+            resting_hr=55,
+            spo2=97,
+            skin_temp=33.5,
+            sleep_ms=28_800_000,
+        )
+        assert f.hrvRmssdMilli == 42.5
+        assert f.restingHeartRate == 55
+        assert f.spo2Percentage == 97
+        assert f.skinTempCelsius == 33.5
+        assert f.sleepTotalInBedTimeMilli == 28_800_000
+        assert f.sleepPerformancePercentage == 85
+
+    def test_extended_fields_optional(self):
+        """A fact with no extended fields should validate cleanly."""
+        f = _mk_daily_fact("2026-03-16", steps=1000)
+        assert f.hrvRmssdMilli is None
+        assert f.sleepTotalInBedTimeMilli is None
+        assert f.flags == []
+
+
+# ---------------------------------------------------------------
+# Metric availability detection (partial real-world data)
+# ---------------------------------------------------------------
+
+
+class TestMetricAvailabilityPartial:
+    """With the current example data, only core metrics have values.
+    Extended metrics are referenced in sourcesJson but have no stored
+    field values, so they must be reported as unavailable."""
+
+    def setup_method(self):
+        self.svc = SportsService()
+
+    def test_steps_is_available(self):
+        assert self.svc.is_metric_available("steps") is True
+        assert "steps" in self.svc.get_available_metrics()
+
+    def test_recovery_is_available(self):
+        assert self.svc.is_metric_available("recoveryScore") is True
+
+    def test_calories_is_available(self):
+        assert self.svc.is_metric_available("caloriesKcal") is True
+
+    def test_hrv_is_unavailable(self):
+        assert self.svc.is_metric_available("hrvRmssdMilli") is False
+        assert "hrvRmssdMilli" in self.svc.get_unavailable_metrics()
+
+    def test_spo2_is_unavailable(self):
+        assert self.svc.is_metric_available("spo2Percentage") is False
+        assert "spo2Percentage" in self.svc.get_unavailable_metrics()
+
+    def test_resting_hr_is_unavailable(self):
+        assert self.svc.is_metric_available("restingHeartRate") is False
+
+    def test_skin_temp_is_unavailable(self):
+        assert self.svc.is_metric_available("skinTempCelsius") is False
+
+    def test_sleep_performance_is_unavailable(self):
+        assert self.svc.is_metric_available("sleepPerformancePercentage") is False
+
+    def test_sleep_duration_is_unavailable(self):
+        assert self.svc.is_metric_available("sleepTotalInBedTimeMilli") is False
+
+    def test_unavailable_metrics_not_in_available(self):
+        """A metric must be in exactly one of available/unavailable."""
+        available = set(self.svc.get_available_metrics())
+        unavailable = set(self.svc.get_unavailable_metrics())
+        assert available & unavailable == set()
+
+    def test_load_report_exposes_unavailable(self):
+        report = self.svc.load_report
+        assert "hrvRmssdMilli" in report.unavailable_metrics
+        assert "steps" not in report.unavailable_metrics
+
+
+class TestMetricAvailabilitySynthetic:
+    """With a synthetic DailyFact that has every metric filled,
+    all canonical metrics must report as available."""
+
+    def test_all_metrics_available_with_full_data(self):
+        facts = [
+            _mk_daily_fact(
+                "2026-03-16",
+                steps=8000,
+                calories=500,
+                recovery=60,
+                sleep_perf=85,
+                hrv=42,
+                resting_hr=55,
+                spo2=97,
+                skin_temp=33.5,
+                sleep_ms=28_800_000,
+            ),
+        ]
+        svc = _make_svc_with_facts(facts)
+        for metric in [
+            "steps",
+            "caloriesKcal",
+            "recoveryScore",
+            "sleepPerformancePercentage",
+            "hrvRmssdMilli",
+            "restingHeartRate",
+            "spo2Percentage",
+            "skinTempCelsius",
+            "sleepTotalInBedTimeMilli",
+        ]:
+            assert svc.is_metric_available(metric) is True, metric
+        assert svc.get_unavailable_metrics() == []
+
+
+# ---------------------------------------------------------------
+# Availability section in system prompt (summary)
+# ---------------------------------------------------------------
+
+
+class TestAvailabilitySectionInSummary:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_summary_contains_availability_block(self):
+        summary = self.svc.get_summary()
+        assert "ДОСТУПНОСТЬ МЕТРИК" in summary
+        assert "Доступные метрики" in summary
+        assert "Недоступные метрики" in summary
+
+    def test_summary_lists_current_available(self):
+        summary = self.svc.get_summary()
+        assert "шаги" in summary
+        assert "восстановление" in summary
+        assert "калории" in summary
+
+    def test_summary_lists_current_unavailable(self):
+        summary = self.svc.get_summary()
+        assert "HRV" in summary
+        assert "SpO2" in summary
+
+    def test_summary_warns_against_hallucination(self):
+        summary = self.svc.get_summary()
+        assert "не выдумывай" in summary
+
+
+# ---------------------------------------------------------------
+# Stage 4 intent detection
+# ---------------------------------------------------------------
+
+
+class TestStage4IntentDetection:
+    def setup_method(self):
+        self.svc = SportsService()
+
+    def test_detect_hrv(self):
+        assert self.svc._detect_hrv_intent("покажи мой hrv") is True
+        assert self.svc._detect_hrv_intent("вариабельность пульса") is True
+
+    def test_detect_sleep(self):
+        assert self.svc._detect_sleep_intent("как мой сон") is True
+        assert self.svc._detect_sleep_intent("сколько я спал") is True
+        assert self.svc._detect_sleep_intent("show sleep data") is True
+
+    def test_detect_spo2(self):
+        assert self.svc._detect_spo2_intent("покажи spo2") is True
+        assert self.svc._detect_spo2_intent("сатурация кислорода") is True
+
+    def test_detect_resting_hr(self):
+        assert self.svc._detect_resting_hr_intent(
+            "мой пульс в покое за март"
+        ) is True
+
+    def test_detect_skin_temp(self):
+        assert self.svc._detect_skin_temp_intent(
+            "температура кожи за неделю"
+        ) is True
+
+    def test_detect_correlation(self):
+        assert self.svc._detect_correlation_intent(
+            "корреляция восстановления и нагрузки"
+        ) is True
+        assert self.svc._detect_correlation_intent(
+            "есть связь между сном и recovery?"
+        ) is True
+
+    def test_hrv_intent_negative(self):
+        assert self.svc._detect_hrv_intent("покажи шаги") is False
+
+    def test_sleep_intent_negative(self):
+        assert self.svc._detect_sleep_intent("велосипед") is False
+
+
+# ---------------------------------------------------------------
+# Graceful degradation for unavailable metrics
+# ---------------------------------------------------------------
+
+
+class TestGracefulDegradation:
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_hrv_query_no_data_response(self):
+        result = self.svc.get_analytics("покажи мой hrv за март")
+        assert "HRV" in result
+        assert "отсутствуют" in result or "нет" in result
+        # No fabricated numbers
+        assert "42" not in result  # arbitrary guard against hallucination
+
+    def test_spo2_query_no_data_response(self):
+        result = self.svc.get_analytics("мой spo2 за последние 7 дней")
+        assert "SpO2" in result
+        assert "отсутствуют" in result
+
+    def test_resting_hr_query_no_data_response(self):
+        result = self.svc.get_analytics("пульс в покое за март")
+        assert "отсутствуют" in result
+
+    def test_skin_temp_query_no_data_response(self):
+        result = self.svc.get_analytics("температура кожи за март")
+        assert "отсутствуют" in result
+
+    def test_sleep_query_no_data_response(self):
+        result = self.svc.get_analytics("как мой сон за последние 7 дней")
+        assert "СОН" in result
+        assert "отсутствуют" in result
+
+    def test_no_error_on_extended_query_with_empty_data(self):
+        """Querying an unavailable metric must never raise."""
+        # Should not raise
+        self.svc.get_analytics("покажи hrv spo2 пульс в покое температуру кожи")
+
+    def test_extended_metric_builder_with_empty_data_safe(self):
+        result = self.svc._build_extended_metric_analytics(
+            "hrvRmssdMilli", date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "HRV" in result
+        assert "отсутствуют" in result
+
+
+# ---------------------------------------------------------------
+# Extended metric analytics with synthetic full data
+# ---------------------------------------------------------------
+
+
+class TestExtendedMetricsWithFullData:
+    def setup_method(self):
+        facts = [
+            _mk_daily_fact(
+                "2026-03-10",
+                steps=8000, calories=500, recovery=50,
+                sleep_perf=80, hrv=40, resting_hr=58,
+                spo2=96, skin_temp=33.2, sleep_ms=25_200_000,
+            ),
+            _mk_daily_fact(
+                "2026-03-11",
+                steps=9500, calories=620, recovery=65,
+                sleep_perf=88, hrv=48, resting_hr=54,
+                spo2=97, skin_temp=33.4, sleep_ms=28_800_000,
+            ),
+            _mk_daily_fact(
+                "2026-03-12",
+                steps=12000, calories=750, recovery=72,
+                sleep_perf=92, hrv=55, resting_hr=52,
+                spo2=98, skin_temp=33.6, sleep_ms=30_600_000,
+            ),
+            _mk_daily_fact(
+                "2026-03-13",
+                steps=7500, calories=480, recovery=60,
+                sleep_perf=83, hrv=42, resting_hr=56,
+                spo2=96, skin_temp=33.5, sleep_ms=27_000_000,
+            ),
+            _mk_daily_fact(
+                "2026-03-14",
+                steps=10000, calories=680, recovery=68,
+                sleep_perf=90, hrv=50, resting_hr=53,
+                spo2=97, skin_temp=33.3, sleep_ms=29_400_000,
+            ),
+        ]
+        self.svc = _make_svc_with_facts(facts, today=date(2026, 3, 14))
+
+    def test_all_extended_metrics_available(self):
+        for metric in [
+            "hrvRmssdMilli", "restingHeartRate", "spo2Percentage",
+            "skinTempCelsius", "sleepTotalInBedTimeMilli",
+            "sleepPerformancePercentage",
+        ]:
+            assert self.svc.is_metric_available(metric), metric
+
+    def test_hrv_analytics_presents_real_numbers(self):
+        result = self.svc._build_extended_metric_analytics(
+            "hrvRmssdMilli", date(2026, 3, 10), date(2026, 3, 14),
+        )
+        assert "HRV" in result
+        assert "Записей: 5" in result
+        assert "Минимум" in result
+        assert "Максимум" in result
+        # Check that our min/max values appear
+        assert "40.0" in result
+        assert "55.0" in result
+
+    def test_spo2_analytics_presents_real_numbers(self):
+        result = self.svc._build_extended_metric_analytics(
+            "spo2Percentage", date(2026, 3, 10), date(2026, 3, 14),
+        )
+        assert "SPO2" in result.upper()
+        assert "Записей: 5" in result
+        assert "96.0" in result
+        assert "98.0" in result
+
+    def test_resting_hr_analytics(self):
+        result = self.svc._build_extended_metric_analytics(
+            "restingHeartRate", date(2026, 3, 10), date(2026, 3, 14),
+        )
+        assert "пульс в покое".upper() in result.upper() or "ПУЛЬС" in result
+        assert "52.0" in result
+        assert "58.0" in result
+
+    def test_sleep_analytics_with_full_data(self):
+        result = self.svc._build_sleep_analytics(
+            date(2026, 3, 10), date(2026, 3, 14),
+        )
+        assert "СОН" in result
+        assert "Эффективность сна" in result
+        assert "Длительность сна" in result
+        # Don't show "данных нет"
+        assert "данных в источниках нет" not in result
+
+    def test_get_analytics_routes_hrv_to_extended_builder(self):
+        result = self.svc.get_analytics("hrv за 5 дней")
+        assert "HRV" in result
+        # With full synthetic data, must include numbers
+        assert "Записей" in result
+
+
+# ---------------------------------------------------------------
+# Correlations
+# ---------------------------------------------------------------
+
+
+class TestCorrelationsWithPartialData:
+    """Current data has recovery but no sleep/HRV — recovery↔load runs,
+    the other two report 'метрики нет'."""
+
+    def setup_method(self):
+        self.svc = SportsService()
+        self.svc._today = date(2026, 3, 16)
+
+    def test_correlations_section_runs_safely(self):
+        result = self.svc._build_correlations_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "КОРРЕЛЯЦИИ" in result
+
+    def test_sleep_correlation_honest_missing(self):
+        result = self.svc._build_correlations_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "Сон ↔ восстановление" in result
+        assert "нет" in result
+
+    def test_hrv_correlation_honest_missing(self):
+        result = self.svc._build_correlations_analytics(
+            date(2026, 3, 1), date(2026, 3, 16),
+        )
+        assert "HRV" in result
+        assert "данных HRV нет" in result
+
+    def test_correlation_intent_triggers_section(self):
+        result = self.svc.get_analytics(
+            "есть корреляция восстановления и нагрузки?"
+        )
+        assert "КОРРЕЛЯЦИИ" in result
+
+
+class TestCorrelationsWithFullData:
+    def setup_method(self):
+        # Synthetic perfectly-correlated sleep ↔ recovery pairs
+        facts = [
+            _mk_daily_fact(
+                "2026-03-10",
+                recovery=40, sleep_perf=60, hrv=35,
+                calories=300,
+            ),
+            _mk_daily_fact(
+                "2026-03-11",
+                recovery=50, sleep_perf=70, hrv=40,
+                calories=400,
+            ),
+            _mk_daily_fact(
+                "2026-03-12",
+                recovery=60, sleep_perf=80, hrv=45,
+                calories=500,
+            ),
+            _mk_daily_fact(
+                "2026-03-13",
+                recovery=70, sleep_perf=90, hrv=50,
+                calories=600,
+            ),
+        ]
+        self.svc = _make_svc_with_facts(facts, today=date(2026, 3, 13))
+
+    def test_sleep_recovery_strong_positive(self):
+        result = self.svc._build_correlations_analytics(
+            date(2026, 3, 10), date(2026, 3, 13),
+        )
+        assert "Сон ↔ восстановление" in result
+        # We built a perfectly linear pair so r ≈ 1.00
+        assert "r = 1.00" in result or "r = 0.99" in result
+        assert "сильная положительная" in result
+
+    def test_recovery_load_correlation_present(self):
+        result = self.svc._build_correlations_analytics(
+            date(2026, 3, 10), date(2026, 3, 13),
+        )
+        assert "Восстановление ↔ нагрузка" in result
+
+
+class TestPearsonHelper:
+    def test_perfect_positive(self):
+        from app.services.sports import _pearson
+        assert abs(_pearson([1, 2, 3, 4], [2, 4, 6, 8]) - 1.0) < 1e-9
+
+    def test_perfect_negative(self):
+        from app.services.sports import _pearson
+        assert abs(_pearson([1, 2, 3, 4], [8, 6, 4, 2]) + 1.0) < 1e-9
+
+    def test_no_variance_returns_zero(self):
+        from app.services.sports import _pearson
+        assert _pearson([5, 5, 5], [1, 2, 3]) == 0.0
+
+    def test_too_short_returns_zero(self):
+        from app.services.sports import _pearson
+        assert _pearson([1.0], [2.0]) == 0.0
+        assert _pearson([], []) == 0.0
+
+    def test_interpret_correlation(self):
+        from app.services.sports import _interpret_correlation
+        assert "сильная положительная" in _interpret_correlation(0.9)
+        assert "сильная отрицательная" in _interpret_correlation(-0.9)
+        assert "умеренная" in _interpret_correlation(0.5)
+        assert "связи не обнаружено" in _interpret_correlation(0.0)
+
+
+# ---------------------------------------------------------------
+# SportsAgent integration — availability in system prompt
+# ---------------------------------------------------------------
+
+
+class TestSportsAgentStage4:
+    def test_prepare_messages_includes_availability(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "привет"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "ДОСТУПНОСТЬ МЕТРИК" in content
+        assert "Доступные метрики" in content
+
+    def test_prepare_messages_hrv_query_gets_graceful_response(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "какой у меня hrv?"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "HRV" in content
+        assert "отсутствуют" in content
+
+    def test_prepare_messages_sleep_query_gets_graceful_response(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "сколько я спал вчера"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "СОН" in content
+
+
+# ---------------------------------------------------------------
+# Admin endpoint returns unavailable_metrics
+# ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_health_data_status_includes_unavailable_metrics(client):
+    resp = await client.get("/admin/health-data-status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "unavailable_metrics" in data
+    assert isinstance(data["unavailable_metrics"], list)
+    # In the current example data, HRV has no values
+    assert "hrvRmssdMilli" in data["unavailable_metrics"]
+
