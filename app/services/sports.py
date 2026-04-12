@@ -457,6 +457,266 @@ class SportsService:
         return "\n".join(lines)
 
     # ==================================================================
+    # STAGE 5: TEMPLATE-BASED RECOMMENDATIONS + CONFIDENCE
+    # ==================================================================
+
+    def get_recommendations(self) -> str:
+        """Pre-computed, template-based recommendations grounded in data.
+
+        Detects patterns in the data and returns structured observations
+        with confidence levels. Each recommendation references specific
+        data points and includes caveats about data limitations.
+        """
+        if not self._daily_facts and not self._activities:
+            return ""
+
+        items: list[str] = []
+
+        # --- Confidence / data completeness ---
+        confidence = self._build_confidence_section()
+        if confidence:
+            items.append(confidence)
+
+        # --- Pattern detection ---
+        rec = self._check_low_recovery()
+        if rec:
+            items.append(rec)
+
+        rec = self._check_no_training_gap()
+        if rec:
+            items.append(rec)
+
+        rec = self._check_volume_increase()
+        if rec:
+            items.append(rec)
+
+        rec = self._check_steps_below_average()
+        if rec:
+            items.append(rec)
+
+        rec = self._check_recovery_declining()
+        if rec:
+            items.append(rec)
+
+        if not items:
+            return ""
+
+        return "=== РЕКОМЕНДАЦИИ ===\n" + "\n\n".join(items)
+
+    def _build_confidence_section(self) -> str:
+        """Build a confidence / data completeness tag for recommendations."""
+        facts = self._daily_facts
+        if not facts:
+            return "⚠ Данные о здоровье отсутствуют — рекомендации невозможны."
+
+        dates = sorted(f.isoDate for f in facts)
+        total_days = (dates[-1] - dates[0]).days + 1 if dates else 0
+        actual_days = len(dates)
+
+        available = self.get_available_metrics()
+        available_labels = [_METRIC_LABELS_RU[m] for m in available]
+
+        lines = [f"Полнота данных: {actual_days} дн. из {total_days} в периоде"]
+        lines.append(f"Доступные метрики: {', '.join(available_labels) if available_labels else 'нет'}")
+
+        if actual_days < 7:
+            lines.append(
+                "⚠ ВНИМАНИЕ: менее 7 дней данных — недостаточно для "
+                "выявления трендов. Рекомендации ниже носят предварительный "
+                "характер."
+            )
+
+        return "\n".join(lines)
+
+    def _check_low_recovery(self) -> str | None:
+        """Low recovery (<30) — suggest rest day or light activity."""
+        latest_recovery = self._get_latest_recovery()
+        if latest_recovery is None:
+            return None
+        score, rec_date = latest_recovery
+        if score >= 30:
+            return None
+
+        return (
+            f"• Низкое восстановление\n"
+            f"  Наблюдение: показатель восстановления {score:.0f}% ({rec_date})\n"
+            f"  Данные: recoveryScore за {rec_date}\n"
+            f"  Предложение: рассмотрите день отдыха или лёгкую активность\n"
+            f"  Оговорка: один показатель не является основанием для выводов "
+            f"о здоровье — при плохом самочувствии обратитесь к врачу"
+        )
+
+    def _check_no_training_gap(self) -> str | None:
+        """No training for 3+ days — note gap and average frequency."""
+        unique = self._unique_activities
+        if not unique:
+            return None
+
+        today = self._today
+        recent = [a for a in unique if a.startTime.date() <= today]
+        if not recent:
+            return None
+
+        last_training = max(a.startTime.date() for a in recent)
+        gap_days = (today - last_training).days
+        if gap_days < 3:
+            return None
+
+        # Average sessions per week over last 30 days
+        d30 = today - timedelta(days=30)
+        acts_30d = [a for a in unique if d30 <= a.startTime.date() <= today]
+        avg_per_week = len(acts_30d) / 4.0 if acts_30d else 0
+
+        return (
+            f"• Перерыв в тренировках\n"
+            f"  Наблюдение: нет записанных тренировок {gap_days} дней "
+            f"(последняя: {last_training})\n"
+            f"  Данные: активности за последние 30 дней — "
+            f"{len(acts_30d)} тренировок, ~{avg_per_week:.1f} в неделю\n"
+            f"  Предложение: если перерыв не запланирован — "
+            f"можно начать с лёгкой тренировки\n"
+            f"  Оговорка: перерывы могут быть частью плана восстановления"
+        )
+
+    def _check_volume_increase(self) -> str | None:
+        """Training volume increased >20% week-over-week."""
+        unique = self._unique_activities
+        if not unique:
+            return None
+
+        today = self._today
+        # Current week (Mon-today)
+        curr_monday = today - timedelta(days=today.weekday())
+        curr_acts = [
+            a for a in unique
+            if curr_monday <= a.startTime.date() <= today
+        ]
+        curr_duration = sum(a.duration for a in curr_acts)
+
+        # Previous week (Mon-Sun)
+        prev_monday = curr_monday - timedelta(days=7)
+        prev_sunday = curr_monday - timedelta(days=1)
+        prev_acts = [
+            a for a in unique
+            if prev_monday <= a.startTime.date() <= prev_sunday
+        ]
+        prev_duration = sum(a.duration for a in prev_acts)
+
+        if prev_duration == 0:
+            return None
+
+        increase_pct = ((curr_duration - prev_duration) / prev_duration) * 100
+        if increase_pct <= 20:
+            return None
+
+        return (
+            f"• Рост объёма тренировок\n"
+            f"  Наблюдение: объём тренировок увеличился на {increase_pct:.0f}% "
+            f"по сравнению с предыдущей неделей\n"
+            f"  Данные: текущая неделя — {_fmt_duration(curr_duration)} "
+            f"({len(curr_acts)} трен.), прошлая — "
+            f"{_fmt_duration(prev_duration)} ({len(prev_acts)} трен.)\n"
+            f"  Предложение: резкое увеличение нагрузки повышает риск "
+            f"перетренированности — следите за восстановлением\n"
+            f"  Оговорка: рекомендация на основе 2 недель данных — "
+            f"для точных выводов нужен более длительный период"
+        )
+
+    def _check_steps_below_average(self) -> str | None:
+        """Steps consistently below 30-day average this week."""
+        if not self.is_metric_available("steps"):
+            return None
+
+        today = self._today
+        d30 = today - timedelta(days=30)
+        facts_30d = [
+            f for f in self._daily_facts
+            if d30 <= f.isoDate <= today and f.steps > 0
+        ]
+        if len(facts_30d) < 7:
+            return None
+
+        avg_30d = sum(f.steps for f in facts_30d) / len(facts_30d)
+
+        d7 = today - timedelta(days=7)
+        facts_7d = [f for f in facts_30d if f.isoDate >= d7]
+        if not facts_7d:
+            return None
+
+        avg_7d = sum(f.steps for f in facts_7d) / len(facts_7d)
+
+        if avg_7d >= avg_30d:
+            return None
+
+        return (
+            f"• Снижение шагов\n"
+            f"  Наблюдение: средние шаги за неделю — "
+            f"{_fmt_steps(int(avg_7d))}/день "
+            f"(vs 30-дневное среднее: {_fmt_steps(int(avg_30d))}/день)\n"
+            f"  Данные: {len(facts_7d)} дн. за последнюю неделю, "
+            f"{len(facts_30d)} дн. за 30 дней\n"
+            f"  Предложение: постарайтесь увеличить повседневную активность\n"
+            f"  Оговорка: разница может быть вызвана погодой, графиком или "
+            f"отсутствием данных за отдельные дни"
+        )
+
+    def _check_recovery_declining(self) -> str | None:
+        """Recovery trend declining over last N days."""
+        if not self.is_metric_available("recoveryScore"):
+            return None
+
+        today = self._today
+        d7 = today - timedelta(days=7)
+        recent = sorted(
+            [
+                f for f in self._daily_facts
+                if d7 <= f.isoDate <= today and f.recoveryScore is not None
+            ],
+            key=lambda f: f.isoDate,
+        )
+
+        if len(recent) < 3:
+            return None
+
+        scores = [f.recoveryScore for f in recent]
+        first_half = scores[: len(scores) // 2]
+        second_half = scores[len(scores) // 2:]
+        avg_first = sum(first_half) / len(first_half)
+        avg_second = sum(second_half) / len(second_half)
+
+        if avg_second >= avg_first:
+            return None
+
+        decline = avg_first - avg_second
+
+        if decline < 5:
+            return None
+
+        return (
+            f"• Снижение восстановления\n"
+            f"  Наблюдение: тренд восстановления снижается за последние "
+            f"{len(recent)} дней (среднее: {avg_first:.0f}% → {avg_second:.0f}%)\n"
+            f"  Данные: recoveryScore за {recent[0].isoDate} — "
+            f"{recent[-1].isoDate} ({len(recent)} записей)\n"
+            f"  Предложение: обратите внимание на качество сна и "
+            f"интенсивность нагрузок\n"
+            f"  Оговорка: на восстановление влияют многие факторы "
+            f"(стресс, питание, болезни) — данные отражают только часть картины"
+        )
+
+    def _get_latest_recovery(self) -> tuple[float, date] | None:
+        """Return (score, date) of the most recent recovery entry, or None."""
+        pairs = [
+            (f.recoveryScore, f.isoDate)
+            for f in self._daily_facts
+            if f.recoveryScore is not None
+        ]
+        if not pairs:
+            return None
+        pairs.sort(key=lambda x: x[1])
+        return pairs[-1]
+
+    # ==================================================================
     # PUBLIC: summary (always in system prompt)
     # ==================================================================
 

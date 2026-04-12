@@ -1,6 +1,6 @@
 """Tests for Sports Assistant — Stage 1 + Stage 2 + Stage 3 analytics."""
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -1681,4 +1681,351 @@ async def test_health_data_status_includes_unavailable_metrics(client):
     assert isinstance(data["unavailable_metrics"], list)
     # In the current example data, HRV has no values
     assert "hrvRmssdMilli" in data["unavailable_metrics"]
+
+
+# ---------------------------------------------------------------
+# Stage 5: Template-based recommendations
+# ---------------------------------------------------------------
+
+
+class TestConfidenceSection:
+    """Data completeness / confidence tags."""
+
+    def test_confidence_includes_day_count(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 16)
+        section = svc._build_confidence_section()
+        assert "дн." in section
+        assert "Доступные метрики" in section
+
+    def test_confidence_warns_insufficient_data(self):
+        """< 7 days of data triggers an explicit warning."""
+        svc = SportsService()
+        svc._daily_facts = svc._daily_facts[:3]  # keep only 3 days
+        section = svc._build_confidence_section()
+        assert "менее 7 дней" in section
+
+    def test_confidence_no_warning_sufficient_data(self):
+        """With >= 7 days of data, no insufficient-data warning."""
+        svc = SportsService()
+        svc._today = date(2026, 3, 16)
+        section = svc._build_confidence_section()
+        # We have 20 days of data
+        assert "менее 7 дней" not in section
+
+    def test_confidence_empty_facts(self):
+        svc = SportsService()
+        svc._daily_facts = []
+        section = svc._build_confidence_section()
+        assert "отсутствуют" in section
+
+
+class TestLowRecoveryRecommendation:
+    """Low recovery (<30) pattern detection."""
+
+    def test_triggers_on_low_recovery(self):
+        svc = SportsService()
+        # Keep only one daily-fact with very low recovery
+        svc._daily_facts = [
+            DailyFact.model_validate({
+                "id": "low-rec",
+                "isoDate": "2026-03-16",
+                "steps": 1000,
+                "recoveryScore": 15,
+            })
+        ]
+        svc._today = date(2026, 3, 16)
+        result = svc._check_low_recovery()
+        assert result is not None
+        assert "15%" in result
+        assert "Наблюдение" in result
+        assert "Предложение" in result
+        assert "Оговорка" in result
+
+    def test_does_not_trigger_on_normal_recovery(self):
+        svc = SportsService()
+        svc._daily_facts = [
+            DailyFact.model_validate({
+                "id": "ok-rec",
+                "isoDate": "2026-03-16",
+                "steps": 1000,
+                "recoveryScore": 55,
+            })
+        ]
+        svc._today = date(2026, 3, 16)
+        result = svc._check_low_recovery()
+        assert result is None
+
+    def test_does_not_trigger_on_boundary_30(self):
+        svc = SportsService()
+        svc._daily_facts = [
+            DailyFact.model_validate({
+                "id": "bound-rec",
+                "isoDate": "2026-03-16",
+                "steps": 1000,
+                "recoveryScore": 30,
+            })
+        ]
+        svc._today = date(2026, 3, 16)
+        result = svc._check_low_recovery()
+        assert result is None
+
+
+class TestNoTrainingGapRecommendation:
+    """No training for 3+ days pattern."""
+
+    def test_triggers_on_3_day_gap(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 20)  # 4 days after last activity
+        result = svc._check_no_training_gap()
+        assert result is not None
+        assert "Перерыв в тренировках" in result
+        assert "Наблюдение" in result
+        assert "в неделю" in result
+
+    def test_does_not_trigger_when_recent(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 16)  # Same day as last activity
+        result = svc._check_no_training_gap()
+        assert result is None
+
+
+class TestVolumeIncreaseRecommendation:
+    """Training volume increased >20% week-over-week."""
+
+    def test_triggers_on_big_increase(self):
+        svc = SportsService()
+        # Build activities: week 1 small, week 2 big
+        svc._unique_activities = [
+            Activity.model_validate({
+                "id": "w1-1", "title": "Run", "sportType": "running",
+                "duration": 1000, "startTime": "2026-03-02T08:00:00Z",
+                "endTime": "2026-03-02T08:17:00Z", "calories": 200,
+            }),
+            Activity.model_validate({
+                "id": "w2-1", "title": "Run", "sportType": "running",
+                "duration": 2000, "startTime": "2026-03-09T08:00:00Z",
+                "endTime": "2026-03-09T08:33:00Z", "calories": 400,
+            }),
+            Activity.model_validate({
+                "id": "w2-2", "title": "Run", "sportType": "running",
+                "duration": 1500, "startTime": "2026-03-10T08:00:00Z",
+                "endTime": "2026-03-10T08:25:00Z", "calories": 300,
+            }),
+        ]
+        # Mon Mar 9 is start of current week, Mon Mar 2 is prev week
+        svc._today = date(2026, 3, 12)  # Thursday of week 2
+        result = svc._check_volume_increase()
+        assert result is not None
+        assert "Рост объёма" in result
+        assert "%" in result
+
+    def test_does_not_trigger_on_similar_volume(self):
+        svc = SportsService()
+        svc._unique_activities = [
+            Activity.model_validate({
+                "id": "w1", "title": "Run", "sportType": "running",
+                "duration": 1000, "startTime": "2026-03-02T08:00:00Z",
+                "endTime": "2026-03-02T08:17:00Z", "calories": 200,
+            }),
+            Activity.model_validate({
+                "id": "w2", "title": "Run", "sportType": "running",
+                "duration": 1100, "startTime": "2026-03-09T08:00:00Z",
+                "endTime": "2026-03-09T08:18:00Z", "calories": 220,
+            }),
+        ]
+        svc._today = date(2026, 3, 12)
+        result = svc._check_volume_increase()
+        assert result is None
+
+
+class TestStepsBelowAverageRecommendation:
+    """Steps consistently below 30-day average this week."""
+
+    def _make_service_with_steps(
+        self, steps_30d: list[int], today: date,
+    ) -> SportsService:
+        svc = SportsService()
+        svc._today = today
+        facts = []
+        for i, steps in enumerate(steps_30d):
+            d = today - timedelta(days=len(steps_30d) - 1 - i)
+            facts.append(DailyFact.model_validate({
+                "id": f"steps-{i}",
+                "isoDate": d.isoformat(),
+                "steps": steps,
+            }))
+        svc._daily_facts = facts
+        svc._load_report = svc._build_report()
+        return svc
+
+    def test_triggers_when_week_below_average(self):
+        # 30 days: first 23 days high steps, last 7 days low
+        steps = [10000] * 23 + [3000] * 7
+        svc = self._make_service_with_steps(steps, date(2026, 3, 16))
+        result = svc._check_steps_below_average()
+        assert result is not None
+        assert "Снижение шагов" in result
+        assert "Наблюдение" in result
+
+    def test_does_not_trigger_when_above_average(self):
+        steps = [5000] * 23 + [8000] * 7
+        svc = self._make_service_with_steps(steps, date(2026, 3, 16))
+        result = svc._check_steps_below_average()
+        assert result is None
+
+
+class TestRecoveryDecliningRecommendation:
+    """Recovery trend declining over last days."""
+
+    def test_triggers_on_decline(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 16)
+        # Recovery declining: 70, 60, 50, 40, 30
+        svc._daily_facts = [
+            DailyFact.model_validate({
+                "id": f"dec-{i}",
+                "isoDate": (date(2026, 3, 12) + timedelta(days=i)).isoformat(),
+                "steps": 5000,
+                "recoveryScore": score,
+            })
+            for i, score in enumerate([70, 60, 50, 40, 30])
+        ]
+        svc._load_report = svc._build_report()
+        result = svc._check_recovery_declining()
+        assert result is not None
+        assert "Снижение восстановления" in result
+        assert "→" in result  # avg_first → avg_second
+
+    def test_does_not_trigger_on_stable(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 16)
+        svc._daily_facts = [
+            DailyFact.model_validate({
+                "id": f"stable-{i}",
+                "isoDate": (date(2026, 3, 12) + timedelta(days=i)).isoformat(),
+                "steps": 5000,
+                "recoveryScore": 50,
+            })
+            for i in range(5)
+        ]
+        svc._load_report = svc._build_report()
+        result = svc._check_recovery_declining()
+        assert result is None
+
+
+class TestGetRecommendationsIntegration:
+    """Full get_recommendations() method."""
+
+    def test_returns_empty_when_no_data(self):
+        svc = SportsService()
+        svc._daily_facts = []
+        svc._activities = []
+        svc._unique_activities = []
+        assert svc.get_recommendations() == ""
+
+    def test_includes_confidence_section(self):
+        svc = SportsService()
+        svc._today = date(2026, 3, 16)
+        recs = svc.get_recommendations()
+        assert "РЕКОМЕНДАЦИИ" in recs
+        assert "Полнота данных" in recs
+
+    def test_recommendation_format_has_required_parts(self):
+        """Triggered recommendations follow the 4-part format."""
+        svc = SportsService()
+        svc._daily_facts = [
+            DailyFact.model_validate({
+                "id": "low", "isoDate": "2026-03-16",
+                "steps": 1000, "recoveryScore": 10,
+            })
+        ]
+        svc._today = date(2026, 3, 16)
+        recs = svc.get_recommendations()
+        assert "Наблюдение" in recs
+        assert "Данные" in recs
+        assert "Предложение" in recs
+        assert "Оговорка" in recs
+
+
+# ---------------------------------------------------------------
+# Stage 5: Anti-hallucination tests
+# ---------------------------------------------------------------
+
+
+class TestAntiHallucination:
+    """Verify the agent system prompt prevents hallucination."""
+
+    def test_system_prompt_forbids_medical_advice(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "привет"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "ЗАПРЕЩЕНО" in content
+        assert "медицинские диагнозы" in content.lower() or "добавк" in content
+
+    def test_system_prompt_requires_recommendation_format(self):
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "привет"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "ФОРМАТ РЕКОМЕНДАЦИЙ" in content
+        assert "Наблюдение" in content
+        assert "Оговорка" in content
+
+    def test_unavailable_metric_query_no_invented_values(self):
+        """Query about HRV (unavailable) → system prompt warns, no values."""
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "какой у меня HRV?"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "отсутствуют" in content
+        # Should NOT contain invented HRV values
+        assert "rmssd" not in content.lower() or "нет" in content.lower()
+
+    def test_supplement_query_system_prompt_forbids(self):
+        """System prompt contains rules that forbid supplement advice."""
+        agent = SportsAgent()
+        messages = [
+            {"role": "user", "content": "какие добавки мне принимать?"},
+        ]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        # The system prompt must explicitly forbid supplement recommendations
+        assert "добавк" in content.lower()
+        assert "ЗАПРЕЩЕНО" in content
+
+    def test_marathon_readiness_limited_data(self):
+        """With limited data, recommendations include insufficient-data warning."""
+        agent = SportsAgent()
+        # Override to have only 3 days of data
+        from app.services.sports import sports_service
+        original_facts = sports_service._daily_facts
+        sports_service._daily_facts = original_facts[:3]
+        try:
+            messages = [
+                {"role": "user", "content": "я готов к марафону?"},
+            ]
+            result = agent.prepare_messages(messages)
+            content = result[0]["content"]
+            assert "менее 7 дней" in content or "недостаточно" in content.lower()
+        finally:
+            sports_service._daily_facts = original_facts
+
+    def test_recommendations_injected_into_system_prompt(self):
+        """Recommendations section appears in the prepared system prompt."""
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "как дела?"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "РЕКОМЕНДАЦИИ" in content
+        assert "Полнота данных" in content
+
+    def test_system_prompt_has_data_limitations_rule(self):
+        """System prompt instructs LLM to state data limitations first."""
+        agent = SportsAgent()
+        messages = [{"role": "user", "content": "привет"}]
+        result = agent.prepare_messages(messages)
+        content = result[0]["content"]
+        assert "ограничения данных" in content.lower() or "ограничения" in content.lower()
 
